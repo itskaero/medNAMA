@@ -1,0 +1,130 @@
+"""SQLAlchemy models matching schema.sql."""
+
+from datetime import datetime
+
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import CheckConstraint, ForeignKey, LargeBinary, Text, func
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Book(Base):
+    __tablename__ = "books"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(Text)
+    filename: Mapped[str] = mapped_column(Text, unique=True)
+    status: Mapped[str] = mapped_column(Text, server_default="pending")
+    error_message: Mapped[str | None] = mapped_column(Text, default=None)
+    total_pages: Mapped[int | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    chunks: Mapped[list["Chunk"]] = relationship(back_populates="book", cascade="all, delete-orphan")
+    figures: Mapped[list["Figure"]] = relationship(back_populates="book", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'processing', 'ready', 'failed')"),
+    )
+
+
+class Chunk(Base):
+    __tablename__ = "chunks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    book_id: Mapped[int] = mapped_column(ForeignKey("books.id", ondelete="CASCADE"))
+    chapter: Mapped[str | None] = mapped_column(Text, default=None)
+    page_number: Mapped[int | None] = mapped_column(default=None)
+    content: Mapped[str] = mapped_column(Text)
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(1024), default=None)
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("chunks.id", ondelete="CASCADE"), default=None)
+    extra_metadata: Mapped[dict | None] = mapped_column(JSONB, default=None)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    book: Mapped["Book"] = relationship(back_populates="chunks")
+
+
+class Figure(Base):
+    __tablename__ = "figures"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    book_id: Mapped[int] = mapped_column(ForeignKey("books.id", ondelete="CASCADE"))
+    figure_label: Mapped[str | None] = mapped_column(Text, default=None)
+    caption: Mapped[str | None] = mapped_column(Text, default=None)
+    page_number: Mapped[int | None] = mapped_column(default=None)
+    image_data: Mapped[bytes] = mapped_column(LargeBinary)
+    mime_type: Mapped[str] = mapped_column(Text, server_default="image/png")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    book: Mapped["Book"] = relationship(back_populates="figures")
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(Text, unique=True)
+    password_hash: Mapped[str] = mapped_column(Text)
+    role: Mapped[str] = mapped_column(Text, server_default="student")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    attempts: Mapped[list["QuizAttempt"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        CheckConstraint("role IN ('admin', 'student')"),
+    )
+
+
+class MCQ(Base):
+    __tablename__ = "mcqs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    book_id: Mapped[int | None] = mapped_column(ForeignKey("books.id"), default=None)
+    question_text: Mapped[str] = mapped_column(Text)
+    options: Mapped[dict] = mapped_column(JSONB)
+    correct_option: Mapped[str] = mapped_column(Text)
+    topic: Mapped[str | None] = mapped_column(Text, default=None)
+    main_category: Mapped[str | None] = mapped_column(Text, default=None)
+    sub_category: Mapped[str | None] = mapped_column(Text, default=None)
+    explanation_markdown: Mapped[str | None] = mapped_column(Text, default=None)
+    explanation_citations: Mapped[dict | None] = mapped_column(JSONB, default=None)
+    explanation_figures: Mapped[dict | None] = mapped_column(JSONB, default=None)
+    status: Mapped[str] = mapped_column(Text, server_default="pending")
+    error_message: Mapped[str | None] = mapped_column(Text, default=None)
+
+    book: Mapped["Book | None"] = relationship()
+
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'generating', 'ready', 'failed')"),
+    )
+
+
+class QuizAttempt(Base):
+    __tablename__ = "quiz_attempts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    started_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(default=None)
+    score: Mapped[int | None] = mapped_column(default=None)
+    total_questions: Mapped[int | None] = mapped_column(default=None)
+
+    user: Mapped["User"] = relationship(back_populates="attempts")
+    answers: Mapped[list["AttemptAnswer"]] = relationship(back_populates="attempt", cascade="all, delete-orphan")
+
+
+class AttemptAnswer(Base):
+    __tablename__ = "attempt_answers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    quiz_attempt_id: Mapped[int] = mapped_column(ForeignKey("quiz_attempts.id"))
+    mcq_id: Mapped[int] = mapped_column(ForeignKey("mcqs.id"))
+    selected_option: Mapped[str] = mapped_column(Text)
+    is_correct: Mapped[bool]
+
+    attempt: Mapped["QuizAttempt"] = relationship(back_populates="answers")
+    mcq: Mapped["MCQ"] = relationship()
