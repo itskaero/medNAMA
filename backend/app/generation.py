@@ -123,7 +123,12 @@ def validate_generation(
     return validated
 
 
-def generate_answer(session: Session, query: str, confidence_threshold: float = 0.55) -> dict[str, Any]:
+def generate_answer(
+    session: Session, 
+    query: str, 
+    confidence_threshold: float = 0.55, 
+    history: list[dict[str, str]] | None = None
+) -> dict[str, Any]:
     """Retrieves relevant textbook chunks and generates a grounded response using DeepSeek.
 
     Validates citations and figures server-side to guarantee zero hallucinations.
@@ -227,12 +232,15 @@ def generate_answer(session: Session, query: str, confidence_threshold: float = 
         client = OpenAI(api_key=settings.deepseek_api_key, base_url=settings.deepseek_base_url)
         logger.info(f"Calling DeepSeek API ({settings.deepseek_model})...")
 
+        api_messages = [{"role": "system", "content": system_prompt}]
+        if history:
+            for turn in history:
+                api_messages.append(turn)
+        api_messages.append({"role": "user", "content": user_content})
+
         response = client.chat.completions.create(
             model=settings.deepseek_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
+            messages=api_messages,
             response_format={"type": "json_object"},
             temperature=0.0,  # Minimize creativity to enforce grounding
         )

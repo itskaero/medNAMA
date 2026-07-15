@@ -73,6 +73,7 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     attempts: Mapped[list["QuizAttempt"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    conversations: Mapped[list["ChatConversation"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
     __table_args__ = (
         CheckConstraint("role IN ('admin', 'student')"),
@@ -128,3 +129,57 @@ class AttemptAnswer(Base):
 
     attempt: Mapped["QuizAttempt"] = relationship(back_populates="answers")
     mcq: Mapped["MCQ"] = relationship()
+
+
+class ChatConversation(Base):
+    __tablename__ = "chat_conversations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    title: Mapped[str] = mapped_column(Text, default="New Conversation")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    user: Mapped["User"] = relationship(back_populates="conversations")
+    messages: Mapped[list["ChatMessage"]] = relationship(back_populates="conversation", cascade="all, delete-orphan")
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("chat_conversations.id"))
+    role: Mapped[str] = mapped_column(Text)  # "user" or "ai" or "error"
+    content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    answer_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # Serialized AnswerResponse JSON
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    conversation: Mapped["ChatConversation"] = relationship(back_populates="messages")
+
+
+class MCQBookmark(Base):
+    __tablename__ = "mcq_bookmarks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    mcq_id: Mapped[int] = mapped_column(ForeignKey("mcqs.id"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    user: Mapped["User"] = relationship()
+    mcq: Mapped["MCQ"] = relationship()
+
+
+class ConceptBookmark(Base):
+    __tablename__ = "concept_bookmarks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    content: Mapped[str] = mapped_column(Text)
+    book_title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    page_number: Mapped[int | None] = mapped_column(nullable=True)
+    source_context: Mapped[str | None] = mapped_column(Text, nullable=True)  # e.g., "RAG chatbot" or "MCQ Explanation"
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    user: Mapped["User"] = relationship()
+
+

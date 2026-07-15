@@ -17,11 +17,12 @@ from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+import json
 from app.config import settings
-from app.database import SessionLocal
+from app.database import SessionLocal, engine
 from app.generation import generate_answer, generate_mcq_explanation
 from app.ingestion import ingest_book
-from app.models import Book, Figure, User, MCQ, QuizAttempt
+from app.models import Base, Book, Figure, User, MCQ, QuizAttempt, AttemptAnswer, ChatConversation, ChatMessage, MCQBookmark, ConceptBookmark
 from app.auth import (
     hash_password,
     verify_password,
@@ -66,7 +67,9 @@ async def add_security_headers(request: Request, call_next):
 # Warm up models on application startup to avoid first-query cold-start delay
 @app.on_event("startup")
 def warmup_models():
-    """Warm up and load both quantized embedding and reranker models on startup."""
+    """Build any missing database tables and warm up models on startup."""
+    print("INITIALIZING DATABASE TABLES...")
+    Base.metadata.create_all(bind=engine)
     from app.ingestion import get_embedding_model
     from app.retrieval import get_reranker_model
 
@@ -92,6 +95,19 @@ def get_db():
 class QueryRequest(BaseModel):
     query: str
     confidence_threshold: float = 0.55
+
+
+class ChatQueryRequest(BaseModel):
+    query: str
+    conversation_id: int | None = None
+    confidence_threshold: float = 0.55
+
+
+class ConceptBookmarkCreate(BaseModel):
+    content: str
+    book_title: str | None = None
+    page_number: int | None = None
+    source_context: str | None = None
 
 
 class UserRegister(BaseModel):
@@ -383,12 +399,36 @@ def get_dashboard_stats(
         for main, sub_list in sorted(categories_map.items())
     ]
 
+    recent_attempts = []
+    db_attempts = db.query(QuizAttempt).filter(
+        QuizAttempt.user_id == current_user.id,
+        QuizAttempt.score.isnot(None)
+    ).order_by(QuizAttempt.completed_at.desc()).limit(5).all()
+
+    for att in db_attempts:
+        first_ans = db.query(AttemptAnswer).filter(AttemptAnswer.quiz_attempt_id == att.id).first()
+        category_name = "General Practice"
+        if first_ans:
+            mcq = db.query(MCQ).filter(MCQ.id == first_ans.mcq_id).first()
+            if mcq:
+                category_name = mcq.sub_category or mcq.main_category or "General Practice"
+        
+        recent_attempts.append({
+            "id": att.id,
+            "started_at": att.started_at.isoformat() if att.started_at else None,
+            "completed_at": att.completed_at.isoformat() if att.completed_at else None,
+            "score": att.score,
+            "total_questions": att.total_questions,
+            "category": category_name
+        })
+
     return {
         "total_books": total_books,
         "total_mcqs": total_mcqs,
         "total_quizzes_taken": total_quizzes_taken,
         "average_score": round(avg_score, 1),
-        "categories": categories_list
+        "categories": categories_list,
+        "recent_attempts": recent_attempts
     }
 
 
@@ -422,3 +462,593 @@ def explain_mcq_endpoint(
     db.commit()
 
     return explanation_data
+
+
+# ─── Practice Quiz Management (Phase 11) ───────────────────────
+
+class StartQuizRequest(BaseModel):
+    main_category: str | None = None
+    sub_category: str | None = None
+    num_questions: int = 10
+
+
+class SelectedAnswer(BaseModel):
+    mcq_id: int
+    selected_option: str
+
+
+class SubmitQuizRequest(BaseModel):
+    answers: list[SelectedAnswer]
+
+
+@app.post("/api/quizzes/start")
+def start_quiz_endpoint(
+    req: StartQuizRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Generates a randomized practice quiz, creates a QuizAttempt record, and returns the questions."""
+    from sqlalchemy import func
+    
+    query = db.query(MCQ)
+    
+    if req.sub_category:
+        query = query.filter(MCQ.sub_category == req.sub_category)
+    elif req.main_category:
+        query = query.filter(MCQ.main_category == req.main_category)
+        
+    mcqs = query.order_by(func.random()).limit(req.num_questions).all()
+    
+    if not mcqs:
+        raise HTTPException(
+            status_code=400,
+            detail="No questions found matching the specified category filters."
+        )
+        
+    attempt = QuizAttempt(
+        user_id=current_user.id,
+        total_questions=len(mcqs)
+    )
+    db.add(attempt)
+    db.commit()
+    db.refresh(attempt)
+    
+    # Format questions (excluding deep explanation details initially)
+    mcqs_data = []
+    for m in mcqs:
+        mcqs_data.append({
+            "id": m.id,
+            "question_text": m.question_text,
+            "options": m.options,
+            "correct_option": m.correct_option,
+            "main_category": m.main_category,
+            "sub_category": m.sub_category
+        })
+        
+    return {
+        "quiz_attempt_id": attempt.id,
+        "mcqs": mcqs_data
+    }
+
+
+@app.post("/api/quizzes/{attempt_id}/submit")
+def submit_quiz_endpoint(
+    attempt_id: int,
+    req: SubmitQuizRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Scores a completed practice quiz, records individual choices, and saves results to the database."""
+    from datetime import datetime
+    
+    attempt = db.query(QuizAttempt).filter(
+        QuizAttempt.id == attempt_id,
+        QuizAttempt.user_id == current_user.id
+    ).first()
+    
+    if not attempt:
+        raise HTTPException(
+            status_code=404,
+            detail="Quiz attempt session not found."
+        )
+        
+    if attempt.completed_at is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="This quiz attempt has already been submitted and completed."
+        )
+        
+    # Build a lookup dictionary of MCQs involved in the attempt to minimize DB queries
+    mcq_ids = [ans.mcq_id for ans in req.answers]
+    mcqs = db.query(MCQ).filter(MCQ.id.in_(mcq_ids)).all()
+    mcq_map = {m.id: m for m in mcqs}
+    
+    correct_count = 0
+    attempt_answers = []
+    
+    for ans in req.answers:
+        mcq = mcq_map.get(ans.mcq_id)
+        if not mcq:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Question with ID {ans.mcq_id} is invalid or not found."
+            )
+            
+        selected_upper = ans.selected_option.upper().strip()
+        correct_upper = mcq.correct_option.upper().strip()
+        is_correct = (selected_upper == correct_upper)
+        
+        if is_correct:
+            correct_count += 1
+            
+        ans_record = AttemptAnswer(
+            quiz_attempt_id=attempt.id,
+            mcq_id=mcq.id,
+            selected_option=ans.selected_option,
+            is_correct=is_correct
+        )
+        db.add(ans_record)
+        attempt_answers.append(ans_record)
+        
+    attempt.score = correct_count
+    attempt.completed_at = datetime.utcnow()
+    db.commit()
+    db.refresh(attempt)
+    
+    return {
+        "score": attempt.score,
+        "total_questions": attempt.total_questions,
+        "completed_at": attempt.completed_at
+    }
+
+
+@app.get("/api/quizzes/{attempt_id}")
+def get_quiz_attempt(
+    attempt_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Retrieves the details of a previous quiz attempt, including all questions and selected answers."""
+    attempt = db.query(QuizAttempt).filter(
+        QuizAttempt.id == attempt_id,
+        QuizAttempt.user_id == current_user.id
+    ).first()
+    
+    if not attempt:
+        raise HTTPException(status_code=404, detail="Quiz attempt not found.")
+        
+    answers = db.query(AttemptAnswer).filter(AttemptAnswer.quiz_attempt_id == attempt.id).all()
+    
+    mcqs_data = []
+    selected_answers = {}
+    
+    for ans in answers:
+        mcq = db.query(MCQ).filter(MCQ.id == ans.mcq_id).first()
+        if mcq:
+            mcqs_data.append({
+                "id": mcq.id,
+                "main_category": mcq.main_category,
+                "sub_category": mcq.sub_category,
+                "question_text": mcq.question_text,
+                "options": mcq.options,
+                "correct_option": mcq.correct_option
+            })
+            selected_answers[mcq.id] = ans.selected_option
+            
+    return {
+        "id": attempt.id,
+        "started_at": attempt.started_at.isoformat() if attempt.started_at else None,
+        "completed_at": attempt.completed_at.isoformat() if attempt.completed_at else None,
+        "score": attempt.score,
+        "total_questions": attempt.total_questions,
+        "questions": mcqs_data,
+        "selected_answers": selected_answers
+    }
+
+
+# ======================== CONVERSATIONAL CHAT HISTORY ========================
+
+@app.post("/api/chat/query")
+def chat_query_endpoint(
+    req: ChatQueryRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Conversational RAG query answering endpoint that tracks message logs in DB and maintains LLM memory context."""
+    conv_id = req.conversation_id
+    if not conv_id:
+        # Create a new conversation and auto-title based on the query prefix
+        words = req.query.strip().split()
+        title_text = " ".join(words[:6]) + ("..." if len(words) > 6 else "")
+        if not title_text:
+            title_text = "New Conversation"
+            
+        conv = ChatConversation(user_id=current_user.id, title=title_text)
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+        conv_id = conv.id
+    else:
+        conv = db.query(ChatConversation).filter(
+            ChatConversation.id == conv_id,
+            ChatConversation.user_id == current_user.id
+        ).first()
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation session not found.")
+
+    # Retrieve message history to maintain conversational memory (last 10 turns max)
+    db_messages = db.query(ChatMessage).filter(
+        ChatMessage.conversation_id == conv_id
+    ).order_by(ChatMessage.created_at.asc()).all()
+
+    recent_db_messages = db_messages[-10:] if len(db_messages) > 10 else db_messages
+
+    history = []
+    for msg in recent_db_messages:
+        if msg.role == "user":
+            history.append({"role": "user", "content": msg.content or ""})
+        elif msg.role == "ai":
+            ans_text = ""
+            if msg.answer_json:
+                try:
+                    ans_data = json.loads(msg.answer_json)
+                    ans_text = ans_data.get("answer_markdown", "")
+                except:
+                    pass
+            if not ans_text:
+                ans_text = msg.content or ""
+            history.append({"role": "assistant", "content": ans_text})
+
+    # Call LLM generation pipeline
+    answer_dict = generate_answer(
+        session=db, 
+        query=req.query, 
+        confidence_threshold=req.confidence_threshold,
+        history=history
+    )
+
+    # Save messages to database
+    user_msg = ChatMessage(
+        conversation_id=conv_id,
+        role="user",
+        content=req.query
+    )
+    db.add(user_msg)
+
+    serialized_answer = json.dumps(answer_dict)
+    ai_msg = ChatMessage(
+        conversation_id=conv_id,
+        role="ai",
+        content=answer_dict.get("answer_markdown", ""),
+        answer_json=serialized_answer
+    )
+    db.add(ai_msg)
+
+    from datetime import datetime
+    conv.updated_at = datetime.utcnow()
+    db.commit()
+
+    return {
+        "conversation_id": conv_id,
+        "conversation_title": conv.title,
+        "answer": answer_dict
+    }
+
+
+@app.get("/api/chat/conversations")
+def get_user_conversations(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Returns the user's active chat conversations list ordered by recent updates."""
+    conversations = db.query(ChatConversation).filter(
+        ChatConversation.user_id == current_user.id
+    ).order_by(ChatConversation.updated_at.desc()).all()
+    
+    return [
+        {
+            "id": c.id,
+            "title": c.title,
+            "updated_at": c.updated_at.isoformat() if c.updated_at else None
+        }
+        for c in conversations
+    ]
+
+
+@app.get("/api/chat/conversations/{conversation_id}")
+def get_conversation_history(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Retrieves all chat messages for a specific conversation session."""
+    conv = db.query(ChatConversation).filter(
+        ChatConversation.id == conversation_id,
+        ChatConversation.user_id == current_user.id
+    ).first()
+    
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+        
+    db_messages = db.query(ChatMessage).filter(
+        ChatMessage.conversation_id == conversation_id
+    ).order_by(ChatMessage.created_at.asc()).all()
+    
+    formatted_messages = []
+    for msg in db_messages:
+        answer_data = None
+        if msg.answer_json:
+            try:
+                answer_data = json.loads(msg.answer_json)
+            except:
+                pass
+                
+        formatted_messages.append({
+            "id": f"msg-{msg.id}",
+            "type": "user" if msg.role == "user" else ("error" if msg.role == "error" else "ai"),
+            "content": msg.content,
+            "answer": answer_data,
+            "timestamp": msg.created_at.strftime("%I:%M %p") if msg.created_at else None
+        })
+        
+    return {
+        "id": conv.id,
+        "title": conv.title,
+        "messages": formatted_messages
+    }
+
+
+@app.delete("/api/chat/conversations/{conversation_id}")
+def delete_conversation(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Deletes a chat conversation thread and all its messages."""
+    conv = db.query(ChatConversation).filter(
+        ChatConversation.id == conversation_id,
+        ChatConversation.user_id == current_user.id
+    ).first()
+    
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+        
+    db.delete(conv)
+    db.commit()
+    
+    return {"message": "Conversation deleted successfully."}
+
+
+# ======================== MCQ BANK & BOOKMARKS ========================
+
+@app.get("/api/mcqs")
+def get_all_mcqs(
+    category: str | None = None,
+    search: str | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Retrieves list of all MCQs inside the database with category filters, searches, and bookmark indicators."""
+    query = db.query(MCQ)
+    if category and category != "all":
+        query = query.filter(MCQ.main_category == category)
+    if search:
+        query = query.filter(MCQ.question_text.ilike(f"%{search}%"))
+        
+    mcqs = query.limit(100).all()
+    
+    # Fetch user's bookmarked MCQ IDs
+    bookmarks = db.query(MCQBookmark.mcq_id).filter(MCQBookmark.user_id == current_user.id).all()
+    bookmarked_ids = {b[0] for b in bookmarks}
+    
+    return [
+        {
+            "id": m.id,
+            "main_category": m.main_category,
+            "sub_category": m.sub_category,
+            "question_text": m.question_text,
+            "options": m.options,
+            "correct_option": m.correct_option,
+            "bookmarked": m.id in bookmarked_ids
+        }
+        for m in mcqs
+    ]
+
+
+@app.post("/api/bookmarks/mcq/{mcq_id}")
+def toggle_mcq_bookmark(
+    mcq_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Toggles bookmark status of an MCQ for the current student."""
+    mcq = db.query(MCQ).filter(MCQ.id == mcq_id).first()
+    if not mcq:
+        raise HTTPException(status_code=404, detail="MCQ not found.")
+        
+    existing = db.query(MCQBookmark).filter(
+        MCQBookmark.user_id == current_user.id,
+        MCQBookmark.mcq_id == mcq_id
+    ).first()
+    
+    if existing:
+        db.delete(existing)
+        db.commit()
+        return {"bookmarked": False}
+    else:
+        bookmark = MCQBookmark(user_id=current_user.id, mcq_id=mcq_id)
+        db.add(bookmark)
+        db.commit()
+        return {"bookmarked": True}
+
+
+@app.get("/api/bookmarks/mcq")
+def get_mcq_bookmarks(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Returns the list of questions bookmarked by the user."""
+    bookmarks = db.query(MCQBookmark).filter(MCQBookmark.user_id == current_user.id).all()
+    return [
+        {
+            "id": b.mcq.id,
+            "main_category": b.mcq.main_category,
+            "sub_category": b.mcq.sub_category,
+            "question_text": b.mcq.question_text,
+            "options": b.mcq.options,
+            "correct_option": b.mcq.correct_option,
+            "bookmarked": True
+        }
+        for b in bookmarks if b.mcq
+    ]
+
+
+@app.post("/api/bookmarks/concept")
+def create_concept_bookmark(
+    req: ConceptBookmarkCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Creates a persistent bookmark for textbook lines, RAG chatbot answers, or question concepts."""
+    if not req.content.strip():
+        raise HTTPException(status_code=400, detail="Content cannot be empty.")
+        
+    bookmark = ConceptBookmark(
+        user_id=current_user.id,
+        content=req.content,
+        book_title=req.book_title,
+        page_number=req.page_number,
+        source_context=req.source_context
+    )
+    db.add(bookmark)
+    db.commit()
+    db.refresh(bookmark)
+    return {
+        "id": bookmark.id,
+        "content": bookmark.content,
+        "book_title": bookmark.book_title,
+        "page_number": bookmark.page_number,
+        "source_context": bookmark.source_context,
+        "created_at": bookmark.created_at.isoformat()
+    }
+
+
+@app.get("/api/bookmarks/concept")
+def get_concept_bookmarks(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Lists all the saved textbook concepts, citation selections, or RAG answers."""
+    bookmarks = db.query(ConceptBookmark).filter(
+        ConceptBookmark.user_id == current_user.id
+    ).order_by(ConceptBookmark.created_at.desc()).all()
+    
+    return [
+        {
+            "id": b.id,
+            "content": b.content,
+            "book_title": b.book_title,
+            "page_number": b.page_number,
+            "source_context": b.source_context,
+            "created_at": b.created_at.strftime("%b %d, %Y %I:%M %p") if b.created_at else None
+        }
+        for b in bookmarks
+    ]
+
+
+@app.delete("/api/bookmarks/concept/{bookmark_id}")
+def delete_concept_bookmark(
+    bookmark_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Deletes a saved concept/text bookmark."""
+    bookmark = db.query(ConceptBookmark).filter(
+        ConceptBookmark.id == bookmark_id,
+        ConceptBookmark.user_id == current_user.id
+    ).first()
+    if not bookmark:
+        raise HTTPException(status_code=404, detail="Bookmark not found.")
+    db.delete(bookmark)
+    db.commit()
+    return {"message": "Concept bookmark deleted successfully."}
+
+
+# ======================== DETAILED TELEMETRY STATS ========================
+
+@app.get("/api/dashboard/detailed-stats")
+def get_detailed_stats(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Fetches comprehensive mock attempts stats, category accuracies, and attempt trends for Chart.js dashboard charts."""
+    attempts = db.query(QuizAttempt).filter(
+        QuizAttempt.user_id == current_user.id,
+        QuizAttempt.completed_at != None
+    ).order_by(QuizAttempt.started_at.asc()).all()
+    
+    total_attempts = len(attempts)
+    if total_attempts == 0:
+        return {
+            "total_attempts": 0,
+            "avg_accuracy": 0,
+            "total_questions": 0,
+            "history_trend": [],
+            "category_breakdown": {}
+        }
+        
+    total_score = sum(a.score for a in attempts if a.score)
+    total_questions = sum(a.total_questions for a in attempts if a.total_questions)
+    avg_accuracy = round((total_score / total_questions) * 100, 1) if total_questions > 0 else 0
+    
+    # Accuracy trend over time (last 15 completed mock sessions)
+    trend = []
+    for a in attempts[-15:]:
+        acc = round((a.score / a.total_questions) * 100, 1) if a.total_questions and a.total_questions > 0 else 0
+        date_str = a.started_at.strftime("%b %d") if a.started_at else "N/A"
+        trend.append({
+            "attempt_id": a.id,
+            "date": date_str,
+            "accuracy": acc,
+            "score": a.score,
+            "total": a.total_questions
+        })
+        
+    # Group and count correct answers and totals per subject category
+    category_breakdown = {}
+    answers_query = db.query(AttemptAnswer.is_correct, MCQ.main_category).join(
+        MCQ, MCQ.id == AttemptAnswer.mcq_id
+    ).join(
+        QuizAttempt, QuizAttempt.id == AttemptAnswer.quiz_attempt_id
+    ).filter(
+        QuizAttempt.user_id == current_user.id,
+        QuizAttempt.completed_at != None
+    ).all()
+    
+    for is_correct, cat in answers_query:
+        category_name = cat if cat else "General"
+        if category_name not in category_breakdown:
+            category_breakdown[category_name] = {"correct": 0, "total": 0}
+        category_breakdown[category_name]["total"] += 1
+        if is_correct:
+            category_breakdown[category_name]["correct"] += 1
+            
+    formatted_breakdown = {}
+    for cat, stats in category_breakdown.items():
+        formatted_breakdown[cat] = {
+            "total_questions": stats["total"],
+            "correct_answers": stats["correct"],
+            "accuracy": round((stats["correct"] / stats["total"]) * 100, 1)
+        }
+        
+    return {
+        "total_attempts": total_attempts,
+        "avg_accuracy": avg_accuracy,
+        "total_questions": total_questions,
+        "history_trend": trend,
+        "category_breakdown": formatted_breakdown
+    }
+
+
+
+
