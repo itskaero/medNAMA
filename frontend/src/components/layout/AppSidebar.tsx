@@ -211,7 +211,7 @@ export default function AppSidebar({
       </div>
 
       {/* Upload — admin only */}
-      {isAdmin && (
+      {isAdmin && process.env.NEXT_PUBLIC_CLOUD_MODE !== "true" && (
         <div className="sidebar-upload">
           <input
             type="file"
