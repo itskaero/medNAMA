@@ -31,7 +31,14 @@ class Settings(BaseSettings):
     # Ingestion
     max_upload_size_mb: int = 500
 
-    model_config = {"env_file": find_env_file(), "env_file_encoding": "utf-8"}
+    # CORS
+    allowed_origins: str = "http://localhost:3000"
+
+    model_config = {
+        "env_file": find_env_file(), 
+        "env_file_encoding": "utf-8",
+        "extra": "ignore"
+    }
 
 
 settings = Settings()

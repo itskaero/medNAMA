@@ -2,6 +2,24 @@ import { marked } from "marked";
 
 const CITATION_PILL_REGEX = /\[([^\]\n]+)\]/g;
 
+// Custom marked renderer for premium warm code blocks with filename and copy buttons
+marked.use({
+  renderer: {
+    code({ text, lang }) {
+      const filename = lang || "code";
+      return `
+        <div class="code-block-wrapper">
+          <div class="code-block-header">
+            <span class="code-block-filename">${filename}</span>
+            <button class="code-block-copy-btn" onclick="navigator.clipboard.writeText(this.closest('.code-block-wrapper').querySelector('pre').innerText.trim() || ''); this.innerText='Copied!'; const btn=this; setTimeout(() => btn.innerText='Copy', 2000);">Copy</button>
+          </div>
+          <pre><code>${text}</code></pre>
+        </div>
+      `;
+    }
+  }
+});
+
 export function parseMarkdown(text: string): string {
   if (!text) return "";
   try {

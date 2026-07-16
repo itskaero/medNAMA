@@ -1,0 +1,295 @@
+"use client";
+
+import React from "react";
+import {
+  Stethoscope,
+  LogOut,
+  Upload,
+  BookOpen,
+  BookMarked,
+  Bookmark,
+  GraduationCap,
+  TrendingUp,
+  LayoutDashboard,
+  MessageSquare,
+  Loader2,
+  Moon,
+  Sun,
+  Compass,
+  Sunset,
+} from "lucide-react";
+import { Book } from "@/types";
+import { BookItem } from "@/components";
+
+interface AppSidebarProps {
+  activeView: string;
+  setActiveView: (view: any) => void;
+  mobileMenuOpen: boolean;
+  setMobileMenuOpen: (v: boolean) => void;
+  username: string | null;
+  role: string | null;
+  isAdmin: boolean;
+  books: Book[];
+  isLoadingBooks: boolean;
+  uploading: boolean;
+  uploadError: string | null;
+  theme: "dark" | "light" | "balanced" | "warm";
+  setTheme: (v: "dark" | "light" | "balanced" | "warm") => void;
+  handleLogout: () => void;
+  handleFileUpload: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  handleDeleteBook: (bookId: number, title: string) => void;
+  fileRef: React.RefObject<HTMLInputElement | null>;
+  setSelectedTopic: (topic: any) => void;
+  fetchMcqs: (category?: string, search?: string) => void;
+  fetchBookmarks: () => void;
+  fetchDetailedStats: () => void;
+  mcqFilterCategory: string;
+  mcqSearchText: string;
+}
+
+export default function AppSidebar({
+  activeView,
+  setActiveView,
+  mobileMenuOpen,
+  setMobileMenuOpen,
+  username,
+  role,
+  isAdmin,
+  books,
+  isLoadingBooks,
+  uploading,
+  uploadError,
+  theme,
+  setTheme,
+  handleLogout,
+  handleFileUpload,
+  handleDeleteBook,
+  fileRef,
+  setSelectedTopic,
+  fetchMcqs,
+  fetchBookmarks,
+  fetchDetailedStats,
+  mcqFilterCategory,
+  mcqSearchText,
+}: AppSidebarProps) {
+  const initials = username ? username.slice(0, 2).toUpperCase() : "DR";
+
+  return (
+    <aside className={`sidebar ${mobileMenuOpen ? "mobile-open" : ""}`} aria-label="Navigation & Library">
+      {/* Brand */}
+      <div
+        className="sidebar-brand"
+        style={{ cursor: "pointer" }}
+        onClick={() => {
+          setActiveView("dashboard");
+          setMobileMenuOpen(false);
+        }}
+      >
+        <div className="brand-mark" aria-hidden>
+          <Stethoscope size={18} />
+        </div>
+        <span className="brand-name">
+          med<span>NAMA</span>
+        </span>
+      </div>
+
+      {/* Profile */}
+      <div className="sidebar-profile">
+        <div className="avatar" aria-hidden>
+          {initials}
+        </div>
+        <div className="profile-meta">
+          <div className="profile-name">{username}</div>
+          <div className={`profile-badge ${role === "student" ? "role-student" : ""}`}>{role}</div>
+        </div>
+        <button className="btn-logout" onClick={handleLogout} aria-label="Sign out">
+          <LogOut size={12} style={{ display: "inline", marginRight: 4 }} />
+          Sign out
+        </button>
+      </div>
+
+      {/* Workspace Navigation Links */}
+      <div
+        style={{
+          padding: "var(--sp-2) var(--sp-3)",
+          display: "flex",
+          flexDirection: "column",
+          gap: "2px",
+          borderBottom: "1px solid var(--border)",
+        }}
+      >
+        <button
+          className={`btn-workspace-nav ${activeView === "dashboard" ? "active" : ""}`}
+          onClick={() => {
+            setActiveView("dashboard");
+            setMobileMenuOpen(false);
+          }}
+        >
+          <LayoutDashboard size={14} />
+          Dashboard
+        </button>
+        <button
+          className={`btn-workspace-nav ${activeView === "chat" ? "active" : ""}`}
+          onClick={() => {
+            setActiveView("chat");
+            setMobileMenuOpen(false);
+          }}
+        >
+          <Stethoscope size={14} style={{ color: "var(--sky)" }} />
+          Discuss with Dr MedNama
+        </button>
+        <button
+          className={`btn-workspace-nav ${activeView === "mcq-bank" ? "active" : ""}`}
+          onClick={() => {
+            setActiveView("mcq-bank");
+            setMobileMenuOpen(false);
+          }}
+        >
+          <BookMarked size={14} />
+          MCQ Bank
+        </button>
+        <button
+          className={`btn-workspace-nav ${activeView === "bookmarks" ? "active" : ""}`}
+          onClick={() => {
+            setActiveView("bookmarks");
+            setMobileMenuOpen(false);
+          }}
+        >
+          <Bookmark size={14} />
+          Bookmarks
+        </button>
+        <button
+          className={`btn-workspace-nav ${activeView === "quiz" ? "active" : ""}`}
+          onClick={() => {
+            setSelectedTopic(null);
+            setActiveView("quiz");
+            setMobileMenuOpen(false);
+          }}
+        >
+          <GraduationCap size={14} />
+          Mock Builder
+        </button>
+        <button
+          className={`btn-workspace-nav ${activeView === "stats" ? "active" : ""}`}
+          onClick={() => {
+            setActiveView("stats");
+            setMobileMenuOpen(false);
+          }}
+        >
+          <TrendingUp size={14} />
+          Stats
+        </button>
+      </div>
+
+      {/* Library */}
+      <div className="sidebar-section-label" aria-label="Library section">
+        Reference Library
+      </div>
+      <div className="book-list" role="list" aria-label="Uploaded textbooks">
+        {isLoadingBooks ? (
+          <div style={{ padding: "24px 12px", textAlign: "center", color: "var(--text-muted)" }}>
+            <Loader2
+              size={20}
+              style={{ margin: "0 auto 8px", display: "block", animation: "spin 1s linear infinite" }}
+            />
+            <span style={{ fontSize: "0.75rem" }}>Loading library…</span>
+          </div>
+        ) : books.length === 0 ? (
+          <div className="books-empty">
+            <BookOpen size={32} />
+            <p>
+              {isAdmin
+                ? "Upload your first PDF textbook below."
+                : "No textbooks available. Ask your administrator to add books."}
+            </p>
+          </div>
+        ) : (
+          books.map((b) => (
+            <BookItem key={b.id} book={b} isAdmin={isAdmin} onDelete={handleDeleteBook} />
+          ))
+        )}
+      </div>
+
+      {/* Upload — admin only */}
+      {isAdmin && (
+        <div className="sidebar-upload">
+          <input
+            type="file"
+            accept=".pdf"
+            style={{ display: "none" }}
+            ref={fileRef}
+            onChange={handleFileUpload}
+            aria-hidden
+          />
+          <button
+            className="upload-btn"
+            onClick={() => fileRef.current?.click()}
+            disabled={uploading}
+            aria-label="Upload PDF textbook"
+          >
+            {uploading ? (
+              <>
+                <Loader2 size={15} style={{ animation: "spin 1s linear infinite" }} />
+                Ingesting…
+              </>
+            ) : (
+              <>
+                <Upload size={15} />
+                Upload Textbook
+              </>
+            )}
+          </button>
+          {uploadError && (
+            <div className="upload-error" role="alert">
+              {uploadError}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Sidebar Theme Switcher Footer */}
+      <div
+        style={{
+          padding: "var(--sp-3) var(--sp-4)",
+          borderTop: "1px solid var(--border)",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: "8px",
+          background: "var(--surface-1)",
+          flexShrink: 0,
+        }}
+      >
+        <button
+          className="btn-workspace"
+          style={{
+            flex: 1,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: "8px",
+            padding: "8px 12px",
+            fontSize: "0.78rem",
+          }}
+          onClick={() => {
+            const themes: Array<"dark" | "light" | "balanced" | "warm"> = [
+              "dark",
+              "light",
+              "balanced",
+              "warm",
+            ];
+            const nextIdx = (themes.indexOf(theme) + 1) % themes.length;
+            setTheme(themes[nextIdx]);
+          }}
+          aria-label="Cycle theme mode"
+        >
+          {theme === "dark" && <Moon size={13} style={{ color: "var(--teal)" }} />}
+          {theme === "light" && <Sun size={13} style={{ color: "var(--teal)" }} />}
+          {theme === "balanced" && <Compass size={13} style={{ color: "var(--teal)" }} />}
+          {theme === "warm" && <Sunset size={13} style={{ color: "var(--teal)" }} />}
+          <span style={{ textTransform: "capitalize", fontWeight: 500 }}>{theme} Mode</span>
+        </button>
+      </div>
+    </aside>
+  );
+}

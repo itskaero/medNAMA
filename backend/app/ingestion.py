@@ -156,8 +156,17 @@ def _process_slice_worker(args: dict) -> dict:
                     continue
                 fig_idx += 1
 
+                # Convert image to RGB (JPEGs don't support RGBA)
+                if pil_image.mode in ("RGBA", "P"):
+                    pil_image = pil_image.convert("RGB")
+                
+                # Resize if the image is too large (max 1000px on either side)
+                max_size = 1000
+                if max(pil_image.width, pil_image.height) > max_size:
+                    pil_image.thumbnail((max_size, max_size))
+
                 buf = io.BytesIO()
-                pil_image.save(buf, format="PNG")
+                pil_image.save(buf, format="JPEG", quality=80, optimize=True)
                 image_bytes = buf.getvalue()
 
                 page_num = None
@@ -170,7 +179,7 @@ def _process_slice_worker(args: dict) -> dict:
                     "caption": None,
                     "page_number": page_num,
                     "image_data": image_bytes,
-                    "mime_type": "image/png",
+                    "mime_type": "image/jpeg",
                 })
 
             for fig in figures_data:

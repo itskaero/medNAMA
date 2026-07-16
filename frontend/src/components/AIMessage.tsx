@@ -43,10 +43,13 @@ export function AIMessage({
 
   return (
     <div className="ai-message" role="article" aria-label="AI response">
-      <div className="ai-avatar" aria-hidden>
-        <Stethoscope size={16} />
-      </div>
       <div className="ai-body">
+        {/* Editorial Brand Header */}
+        <div className="ai-editorial-header">
+          <Stethoscope size={13} className="ai-editorial-icon" />
+          <span className="ai-editorial-name">Dr. MedNama</span>
+        </div>
+        
         {msg.type === "thinking" ? (
           <div className="thinking" aria-live="polite" aria-label="Generating answer">
             <div className="thinking-dots" aria-hidden>
@@ -54,7 +57,9 @@ export function AIMessage({
               <span className="thinking-dot" />
               <span className="thinking-dot" />
             </div>
-            {stagesText[thinkingStage]}
+            <span style={{ fontSize: "0.82rem", color: "var(--text-secondary)" }}>
+              {stagesText[thinkingStage]}
+            </span>
           </div>
         ) : null}
         {msg.type === "error" ? (

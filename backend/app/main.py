@@ -37,9 +37,10 @@ from app.auth import (
 app = FastAPI(title="medNAMA Core API", version="1.0.0")
 
 # Enable CORS with explicit trusted origins (required for allow_credentials=True with HttpOnly cookies)
+origins = [origin.strip() for origin in settings.allowed_origins.split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -150,7 +151,7 @@ def register_user(user_in: UserRegister, db: Session = Depends(get_db)):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role specification.")
 
     hashed_pw = hash_password(user_in.password)
-    user = User(username=user_in.username, password_hash=hashed_pw, role=user_in.role)
+    user = User(username=user_in.username, password_hash=hashed_pw, role="student")
     db.add(user)
     db.commit()
 
@@ -467,9 +468,13 @@ def explain_mcq_endpoint(
 # ─── Practice Quiz Management (Phase 11) ───────────────────────
 
 class StartQuizRequest(BaseModel):
-    main_category: str | None = None
-    sub_category: str | None = None
+    categories: list[str] | None = None
+    sub_categories: list[str] | None = None
     num_questions: int = 10
+    exclude_mastered: bool = False
+    timer_mode: str = "none"                      # "none" | "session" | "per_question"
+    timer_value: int | None = None                # minutes or seconds
+    feedback_mode: str = "tutor"                  # "tutor" | "board"
 
 
 class SelectedAnswer(BaseModel):
@@ -489,25 +494,40 @@ def start_quiz_endpoint(
 ):
     """Generates a randomized practice quiz, creates a QuizAttempt record, and returns the questions."""
     from sqlalchemy import func
+    from app.models import AttemptAnswer, QuizAttempt
     
     query = db.query(MCQ)
     
-    if req.sub_category:
-        query = query.filter(MCQ.sub_category == req.sub_category)
-    elif req.main_category:
-        query = query.filter(MCQ.main_category == req.main_category)
+    # Topic filters
+    if req.sub_categories:
+        query = query.filter(MCQ.sub_category.in_(req.sub_categories))
+    elif req.categories:
+        query = query.filter(MCQ.main_category.in_(req.categories))
+        
+    # Exclude mastered questions (answered correctly in any past attempt)
+    if req.exclude_mastered:
+        mastered_subquery = db.query(AttemptAnswer.mcq_id).join(
+            QuizAttempt, QuizAttempt.id == AttemptAnswer.quiz_attempt_id
+        ).filter(
+            QuizAttempt.user_id == current_user.id,
+            AttemptAnswer.is_correct == True
+        ).subquery()
+        query = query.filter(MCQ.id.notin_(mastered_subquery))
         
     mcqs = query.order_by(func.random()).limit(req.num_questions).all()
     
     if not mcqs:
         raise HTTPException(
             status_code=400,
-            detail="No questions found matching the specified category filters."
+            detail="No questions found matching the specified filters."
         )
         
     attempt = QuizAttempt(
         user_id=current_user.id,
-        total_questions=len(mcqs)
+        total_questions=len(mcqs),
+        timer_mode=req.timer_mode,
+        timer_value=req.timer_value,
+        feedback_mode=req.feedback_mode
     )
     db.add(attempt)
     db.commit()
@@ -527,7 +547,10 @@ def start_quiz_endpoint(
         
     return {
         "quiz_attempt_id": attempt.id,
-        "mcqs": mcqs_data
+        "mcqs": mcqs_data,
+        "timer_mode": attempt.timer_mode,
+        "timer_value": attempt.timer_value,
+        "feedback_mode": attempt.feedback_mode
     }
 
 
@@ -642,7 +665,10 @@ def get_quiz_attempt(
         "score": attempt.score,
         "total_questions": attempt.total_questions,
         "questions": mcqs_data,
-        "selected_answers": selected_answers
+        "selected_answers": selected_answers,
+        "timer_mode": attempt.timer_mode,
+        "timer_value": attempt.timer_value,
+        "feedback_mode": attempt.feedback_mode
     }
 
 

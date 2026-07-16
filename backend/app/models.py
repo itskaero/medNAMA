@@ -113,6 +113,9 @@ class QuizAttempt(Base):
     completed_at: Mapped[datetime | None] = mapped_column(default=None)
     score: Mapped[int | None] = mapped_column(default=None)
     total_questions: Mapped[int | None] = mapped_column(default=None)
+    timer_mode: Mapped[str] = mapped_column(Text, server_default="none")
+    timer_value: Mapped[int | None] = mapped_column(default=None)
+    feedback_mode: Mapped[str] = mapped_column(Text, server_default="tutor")
 
     user: Mapped["User"] = relationship(back_populates="attempts")
     answers: Mapped[list["AttemptAnswer"]] = relationship(back_populates="attempt", cascade="all, delete-orphan")
