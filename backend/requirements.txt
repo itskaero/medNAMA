@@ -21,4 +21,4 @@ openai>=1.0
 
 # Auth (Phase 7)
 passlib[bcrypt]>=1.7
-python-jose[cryptography]>=3.3
+pyjwt>=2.8.0
