@@ -139,15 +139,20 @@ class MCQ(Base):
 
 ---
 
-## 5. Frontend UI Component Breakdown
+## 5. Frontend UI Component Breakdown & Enhancements
 
 1. **AI Quiz Studio View (`AIQuizStudioView.tsx`)**:
-   - Freeform prompt bar with suggestion pills.
-   - Recent AI Quizzes History panel with **"🎯 Take Quiz"** and **"🗑️ Delete"** actions.
+   - **Freeform Prompt Bar**: Conversational text input with interactive suggestion chips (*"⚡ 5 MCQs from Guyton page 120"*, *"🫀 Cardiovascular Rapid Recall"*, *"🫁 Pulmonary Physiology Board Exam"*).
+   - **Quiz History Panel**: Fetches metadata via `GET /api/chat/ai-quizzes` and renders cards showing title, question count, creation timestamp, and 1-click actions:
+     - **"🎯 Take Quiz"** (opens interactive player)
+     - **"🗑️ Delete Set"** (deletes quiz set)
+
 2. **Chat Card Component (`ChatMessage.tsx`)**:
    - Intercepts quiz generation responses and renders an interactive status card with a **"🎯 Take Quiz"** button.
+
 3. **Practice Center Integration (`QuizView.tsx`)**:
    - Accepts `selectedQuizSetId` prop to filter practice session questions to the generated set.
+   - **Textbook Source Citation Footnotes**: Displays exact textbook references (`📖 Source: Guyton & Hall Physiology, Page 120`) alongside explanations for full clinical transparency.
 
 ---
 
