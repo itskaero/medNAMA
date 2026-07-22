@@ -37,21 +37,6 @@ from app.auth import (
 # Initialize FastAPI app
 app = FastAPI(title="medNAMA Core API", version="1.0.0")
 
-# Enable CORS with explicit trusted origins + regex for Vercel preview/production deployments
-origins = [origin.strip() for origin in settings.allowed_origins.split(",") if origin.strip()]
-if "https://med-nama.vercel.app" not in origins:
-    origins.append("https://med-nama.vercel.app")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_origin_regex=r"https://.*\.vercel\.app",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
 # Custom HTTP middleware enforcing security headers (Proposal 11)
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
@@ -68,6 +53,38 @@ async def add_security_headers(request: Request, call_next):
     )
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     return response
+
+
+# Enable CORS LAST so CORSMiddleware is the outermost middleware handling preflights & headers for all responses
+raw_origins = [origin.strip().rstrip("/") for origin in settings.allowed_origins.split(",") if origin.strip()]
+trusted_domains = [
+    "https://med-nama.vercel.app",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+for d in trusted_domains:
+    if d not in raw_origins:
+        raw_origins.append(d)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=raw_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    import logging
+    logging.getLogger("uvicorn.error").error(f"Global unhandled exception: {exc}", exc_info=True)
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal Server Error: {str(exc)}"},
+    )
 
 
 # Warm up models on application startup to avoid first-query cold-start delay
