@@ -639,7 +639,13 @@ def generate_ai_quiz(
         db.add(mcq)
         created_mcqs.append(mcq)
 
-    db.commit()
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        import logging
+        logging.getLogger("uvicorn.error").error(f"Database error committing generated quiz: {e}")
+        raise HTTPException(status_code=500, detail=f"Database commit error: {e}")
 
     return {
         "quiz_set_id": quiz_set_id,

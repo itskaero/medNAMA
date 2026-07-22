@@ -19,7 +19,10 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # Safe cleanup of legacy columns/tables if they exist in any environment
+    # Safe cleanup of legacy columns/tables/triggers if they exist in any environment
+    op.execute("DROP TRIGGER IF EXISTS trigger_sync_user_category_stats ON mcqs;")
+    op.execute("DROP TRIGGER IF EXISTS sync_user_category_stats_trigger ON mcqs;")
+    op.execute("DROP FUNCTION IF EXISTS sync_user_category_stats CASCADE;")
     op.execute("DROP TABLE IF EXISTS user_category_stats CASCADE;")
     op.execute("DROP INDEX IF EXISTS idx_attempt_answers_telemetry;")
     op.execute("ALTER TABLE books DROP COLUMN IF EXISTS pdf_url;")
