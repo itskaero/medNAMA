@@ -1,9 +1,9 @@
 "use client";
 
-import React from "react";
-import { Stethoscope } from "lucide-react";
+import React, { useState } from "react";
+import { Stethoscope, ArrowUpRight, ArrowUp, X, Minus } from "lucide-react";
 import { Message } from "@/types";
-import { FamilyButton } from "@/components/ui/family-button";
+import { motion, AnimatePresence } from "framer-motion";
 
 interface MinimizedChatWidgetProps {
   messages: Message[];
@@ -26,85 +26,91 @@ export default function MinimizedChatWidget({
   setActiveView,
   isChatMinimized,
 }: MinimizedChatWidgetProps) {
+  const [isCollapsed, setIsCollapsed] = useState(true);
+
   if (!isChatMinimized) return null;
 
   return (
-    <div className="minimized-chat-widget">
-      <FamilyButton collapsedIcon={<Stethoscope size={15} />} isSearching={isSearching}>
-        <div style={{ display: "flex", flexDirection: "column", height: "100%", width: "100%" }}>
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              borderBottom: "1px solid var(--border-light)",
-              paddingBottom: "8px",
-              marginBottom: "8px",
-            }}
-          >
-            <span
-              style={{
-                fontSize: "0.75rem",
-                fontWeight: 600,
-                color: "var(--sky)",
-                display: "flex",
-                alignItems: "center",
-                gap: "6px",
-              }}
-            >
-              <Stethoscope size={12} />
-              Dr. MedNama
-            </span>
-            <button
-              className="btn-workspace"
-              style={{ padding: "2px 8px", fontSize: "0.68rem" }}
-              onClick={() => {
-                setIsChatMinimized(false);
-                setActiveView("chat");
-              }}
-            >
-              Maximize
-            </button>
+    <AnimatePresence mode="wait">
+      {isCollapsed ? (
+        <motion.button
+          key="fab"
+          layoutId="chat-widget"
+          initial={{ opacity: 0, scale: 0.8 }}
+          animate={{ opacity: 1, scale: 1 }}
+          exit={{ opacity: 0, scale: 0.8 }}
+          transition={{ type: "spring", stiffness: 400, damping: 25 }}
+          className="minimized-chat-fab"
+          onClick={() => setIsCollapsed(false)}
+          title="Open Quick Chat"
+        >
+          <Stethoscope size={24} />
+        </motion.button>
+      ) : (
+        <motion.div
+          key="pill"
+          layoutId="chat-widget"
+          initial={{ opacity: 0, y: 20, scale: 0.95 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          exit={{ opacity: 0, y: 20, scale: 0.95 }}
+          transition={{ type: "spring", stiffness: 350, damping: 30 }}
+          className="minimized-chat-pill"
+        >
+          <div className="mini-chat-pill-header">
+            <div className="mini-chat-brand">
+              <Stethoscope size={14} className="brand-icon" />
+              <span>Dr. MedNama</span>
+            </div>
+            <div style={{ display: "flex", gap: "2px" }}>
+              <button
+                className="mini-maximize-btn"
+                onClick={() => setIsCollapsed(true)}
+                title="Minimize to Button"
+              >
+                <Minus size={16} />
+              </button>
+              <button
+                className="mini-maximize-btn"
+                onClick={() => {
+                  setIsChatMinimized(false);
+                  setActiveView("chat");
+                }}
+                title="Maximize to Full Chat"
+              >
+                <ArrowUpRight size={16} />
+              </button>
+              <button
+                className="mini-maximize-btn close-btn"
+                onClick={() => setIsChatMinimized(false)}
+                title="Close Widget"
+              >
+                <X size={16} />
+              </button>
+            </div>
           </div>
 
-          {/* Mini Feed showing last 3 messages */}
+          {/* Mini Feed showing last message only for cleanliness */}
           <div className="mini-chat-feed">
             {(() => {
               const visible = messages.filter((m) => m.type === "user" || m.type === "ai");
-              const lastThree = visible.slice(-3);
-              if (lastThree.length === 0) {
-                return (
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      height: "100%",
-                      color: "var(--text-muted)",
-                      fontSize: "0.7rem",
-                    }}
-                  >
-                    No messages yet.
-                  </div>
-                );
+              const lastMsg = visible[visible.length - 1];
+              if (!lastMsg) {
+                return <div className="mini-chat-row empty">No messages yet.</div>;
               }
-              return lastThree.map((msg) => {
-                const isUser = msg.type === "user";
-                const rawContent =
-                  msg.content || (msg.answer ? msg.answer.answer_markdown : "");
-                const cleanText = rawContent.replace(/[#*`_\[\]]/g, "").slice(0, 50);
-                const truncated = cleanText.length > 50 ? cleanText + "..." : cleanText;
+              const isUser = lastMsg.type === "user";
+              const rawContent = lastMsg.content || (lastMsg.answer ? lastMsg.answer.answer_markdown : "");
+              const cleanText = rawContent.replace(/[#*`_\[\]]/g, "").slice(0, 60);
+              const truncated = cleanText.length > 60 ? cleanText + "..." : cleanText;
 
-                return (
-                  <div key={msg.id} className={`mini-chat-row ${isUser ? "user" : "assistant"}`}>
-                    <strong>{isUser ? "You" : "Dr. MedNama"}:</strong> {truncated}
-                  </div>
-                );
-              });
+              return (
+                <div key={lastMsg.id} className={`mini-chat-row ${isUser ? "user" : "assistant"}`}>
+                  <strong>{isUser ? "You" : "MedNama"}:</strong> {truncated}
+                </div>
+              );
             })()}
           </div>
 
-          {/* Quick Reply Form */}
+          {/* Sleek Quick Reply Pill Form */}
           <form
             className="mini-chat-quick-reply"
             onSubmit={(e) => {
@@ -117,22 +123,21 @@ export default function MinimizedChatWidget({
             <input
               type="text"
               className="mini-chat-quick-input"
-              placeholder="Quick reply..."
+              placeholder="Ask a quick question..."
               value={quickReplyVal}
               onChange={(e) => setQuickReplyVal(e.target.value)}
               disabled={isSearching}
             />
             <button
               type="submit"
-              className="btn-primary"
-              style={{ padding: "4px 8px", fontSize: "0.72rem" }}
+              className="mini-chat-send-btn"
               disabled={isSearching || !quickReplyVal.trim()}
             >
-              Send
+              <ArrowUp size={16} />
             </button>
           </form>
-        </div>
-      </FamilyButton>
-    </div>
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }

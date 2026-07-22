@@ -26,5 +26,5 @@ RUN pip install --no-cache-dir -r requirements.txt \
 # Copy backend codebase
 COPY . .
 
-# Heroku exposes a dynamic port via the PORT environment variable
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Run migrations then start the server
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

@@ -116,14 +116,15 @@ export default function ChatView({
         >
           {isSidebarHovered || isSidebarResizing || isSidebarLocked ? (
             <div style={{ display: "flex", alignItems: "center", gap: "8px", width: "100%" }}>
-              <button className="new-chat-btn" onClick={handleNewChat} style={{ flex: 1 }}>
-                <Plus size={14} />
-                New Chat
+              <button className="new-chat-btn" onClick={handleNewChat} style={{ flex: 1, whiteSpace: "nowrap", overflow: "hidden" }}>
+                <Plus size={14} style={{ flexShrink: 0 }} />
+                <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>New Chat</span>
               </button>
               <button
                 className={`sidebar-pin-btn ${isSidebarLocked ? "active" : ""}`}
                 onClick={() => setIsSidebarLocked(!isSidebarLocked)}
                 title={isSidebarLocked ? "Unlock sidebar hover-collapse" : "Lock sidebar expanded"}
+                style={{ flexShrink: 0 }}
               >
                 <Pin size={12} style={{ transform: isSidebarLocked ? "none" : "rotate(-45deg)" }} />
               </button>
@@ -204,6 +205,8 @@ export default function ChatView({
                           color: "var(--text-muted)",
                           padding: "4px var(--sp-3)",
                           fontWeight: 600,
+                          whiteSpace: "nowrap",
+                          overflow: "hidden",
                         }}
                       >
                         {title}
@@ -278,10 +281,7 @@ export default function ChatView({
         <div className="conversation" role="log" aria-label="Conversation" aria-live="polite">
           {messages.length === 0 ? (
             <div className="welcome">
-              <div className="welcome-eyebrow">
-                <Stethoscope size={12} />
-                Clinical Knowledge Assistant
-              </div>
+
               <h1 className="welcome-title">
                 What would you like to <em>research</em> today?
               </h1>

@@ -81,16 +81,6 @@ export default function ExplanationPanel({
 
             {explanationData.figures.length > 0 && (
               <div style={{ marginTop: "12px" }}>
-                <h4
-                  style={{
-                    fontSize: "0.82rem",
-                    fontWeight: 600,
-                    color: "var(--text-primary)",
-                    marginBottom: "6px",
-                  }}
-                >
-                  Extracted Figures
-                </h4>
                 <FiguresDrawer
                   figures={explanationData.figures}
                   token={token}

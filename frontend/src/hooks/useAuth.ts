@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { toast } from "sonner";
 import { API } from "@/lib/constants";
 
 export function useAuth() {
@@ -25,6 +26,7 @@ export function useAuth() {
     setToken(null);
     setUsername(null);
     setRole(null);
+    toast.info("Logged out successfully.");
   };
 
   // Mount + auth restore from localStorage
@@ -82,7 +84,7 @@ export function useAuth() {
         setIsRegisterMode(false);
         setAuthPassword("");
         setAuthError(null);
-        alert("Account created. Please sign in.");
+        toast.success("Account created. Please sign in.");
       } else {
         const params = new URLSearchParams();
         params.append("username", authUsername);
@@ -106,6 +108,7 @@ export function useAuth() {
         setRole(data.role);
         setAuthUsername("");
         setAuthPassword("");
+        toast.success(`Welcome back, ${data.username}!`);
       }
     } catch (err: any) {
       setAuthError(err.message || "Authentication error.");

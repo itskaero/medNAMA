@@ -85,6 +85,8 @@ class MCQ(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     book_id: Mapped[int | None] = mapped_column(ForeignKey("books.id"), default=None)
+    quiz_set_id: Mapped[str | None] = mapped_column(Text, default=None)
+    quiz_set_title: Mapped[str | None] = mapped_column(Text, default=None)
     question_text: Mapped[str] = mapped_column(Text)
     options: Mapped[dict] = mapped_column(JSONB)
     correct_option: Mapped[str] = mapped_column(Text)

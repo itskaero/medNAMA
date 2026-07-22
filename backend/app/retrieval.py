@@ -260,41 +260,8 @@ class RetrievalService:
         return merged_parents[:limit]
 
     def get_or_generate_figure_caption(self, session: Session, figure: Figure) -> str | None:
-        """Fetch figure caption. If NULL, run Gemini Vision on-demand and cache the result."""
-        if figure.caption is not None:
-            return figure.caption
-
-        has_api_key = bool(settings.gemini_api_key and settings.gemini_api_key.strip())
-        if not has_api_key:
-            logger.warning(f"Figure {figure.id} caption requested, but GEMINI_API_KEY is not configured.")
-            return None
-
-        logger.info(f"Generating on-demand caption for Figure {figure.id} (page {figure.page_number})...")
-        try:
-            import google.generativeai as genai
-
-            genai.configure(api_key=settings.gemini_api_key)
-            vision_model = genai.GenerativeModel("gemini-2.0-flash")
-
-            pil_image = Image.open(io.BytesIO(figure.image_data))
-
-            response = vision_model.generate_content([
-                "You are a medical textbook expert. Describe this medical diagram/figure "
-                "in detail. Include all labels, annotations, and what the figure illustrates. "
-                "Be concise but thorough.",
-                pil_image,
-            ])
-            caption = response.text
-
-            figure.caption = caption
-            session.commit()
-            logger.info(f"✓ Figure {figure.id} captioned on-demand and cached in DB.")
-            return caption
-
-        except Exception as e:
-            session.rollback()
-            logger.error(f"Failed generating on-demand caption for Figure {figure.id}: {e}")
-            return None
+        """Fetch figure caption. On-demand generation has been removed to reduce API overhead."""
+        return figure.caption
 
     def retrieve_figures_for_chunks(self, session: Session, chunks: list[Chunk]) -> dict[int, list[dict]]:
         """Retrieve relevant figures for parent chunks based on page numbers."""

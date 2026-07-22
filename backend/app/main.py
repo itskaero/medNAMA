@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 import json
@@ -465,9 +466,218 @@ def explain_mcq_endpoint(
     return explanation_data
 
 
+# ─── AI Quiz Generation System ───────────────────────────────────
+
+class GenerateAiQuizRequest(BaseModel):
+    prompt: str
+    book_id: int | None = None
+    page_number: int | None = None
+    count: int | None = None
+
+
+@app.post("/api/chat/generate-ai-quiz")
+def generate_ai_quiz(
+    req: GenerateAiQuizRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Generates custom board-style MCQs from textbook RAG context or page filters."""
+    import re
+    import uuid
+    from app.retrieval import RetrievalService
+    from openai import OpenAI
+
+    prompt_text = req.prompt.strip()
+    if not prompt_text:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
+
+    # 1. Parse prompt for page number and count if not provided
+    page_num = req.page_number
+    if page_num is None:
+        page_match = re.search(r"page\s*#?\s*(\d+)", prompt_text, re.IGNORECASE)
+        if page_match:
+            page_num = int(page_match.group(1))
+
+    mcq_count = req.count or 5
+    count_match = re.search(r"(\d+)\s*(?:questions?|mcqs?|items?)", prompt_text, re.IGNORECASE)
+    if count_match:
+        try:
+            parsed_count = int(count_match.group(1))
+            if 1 <= parsed_count <= 20:
+                mcq_count = parsed_count
+        except ValueError:
+            pass
+
+    # 2. Retrieve textbook context
+    retrieved_chunks = []
+    if page_num is not None:
+        query = db.query(Chunk)
+        if req.book_id:
+            query = query.filter(Chunk.book_id == req.book_id)
+        retrieved_chunks = query.filter(Chunk.page_number == page_num).all()
+
+    if not retrieved_chunks:
+        # Fallback to RAG vector search
+        retrieval_srv = RetrievalService()
+        retrieved_chunks = retrieval_srv.hybrid_search(db, query=prompt_text, limit=6, book_id=req.book_id)
+
+    context_str = "\n\n".join(
+        [
+            f"[Book: {c.book.title if hasattr(c, 'book') and c.book else 'Textbook'} | Page: {c.page_number or 'N/A'}]\n{c.content}"
+            for c in retrieved_chunks
+        ]
+    )
+
+    if not context_str.strip():
+        context_str = f"Topic: {prompt_text}"
+
+    # 3. Prompt DeepSeek LLM with strict JSON schema
+    system_prompt = (
+        "You are an expert medical educator and board exam question writer. "
+        "Generate high-yield, USMLE/board-style Multiple Choice Questions based strictly on the provided medical textbook context.\n"
+        "Return ONLY valid JSON matching this exact structure:\n"
+        "{\n"
+        '  "quiz_title": "Short descriptive topic title",\n'
+        '  "questions": [\n'
+        "    {\n"
+        '      "question_text": "Clinical vignette question stem...",\n'
+        '      "options": {"A": "Choice A", "B": "Choice B", "C": "Choice C", "D": "Choice D"},\n'
+        '      "correct_option": "A",\n'
+        '      "explanation": "Detailed clinical reasoning explaining why the correct choice is right and others are incorrect.",\n'
+        '      "source_book": "Book Title",\n'
+        '      "source_page": 120\n'
+        "    }\n"
+        "  ]\n"
+        "}"
+    )
+
+    user_prompt = (
+        f"Generate {mcq_count} high-yield MCQs based on the following context and prompt:\n\n"
+        f"USER PROMPT: {prompt_text}\n\n"
+        f"TEXTBOOK CONTEXT:\n{context_str[:6000]}"
+    )
+
+    client = OpenAI(
+        api_key=settings.deepseek_api_key or "sk-dummy",
+        base_url=settings.deepseek_base_url
+    )
+
+    try:
+        completion = client.chat.completions.create(
+            model=settings.deepseek_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.3,
+        )
+        raw_res = completion.choices[0].message.content or "{}"
+        quiz_data = json.loads(raw_res)
+    except Exception as e:
+        logger.error(f"AI Quiz Generation error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate quiz: {e}")
+
+    quiz_title = quiz_data.get("quiz_title") or prompt_text[:40].title()
+    questions = quiz_data.get("questions", [])
+
+    if not questions:
+        raise HTTPException(status_code=500, detail="LLM did not return valid question sets.")
+
+    quiz_set_id = f"quiz_set_{uuid.uuid4().hex[:8]}"
+    created_mcqs = []
+
+    for item in questions:
+        book_id = req.book_id
+        page_ref = item.get("source_page") or page_num
+        source_book_name = item.get("source_book") or "Medical Textbook"
+
+        explanation_txt = item.get("explanation") or "No detailed explanation provided."
+        if page_ref or source_book_name:
+            explanation_txt += f"\n\n**Source**: {source_book_name}, Page {page_ref or 'N/A'}"
+
+        mcq = MCQ(
+            book_id=book_id,
+            quiz_set_id=quiz_set_id,
+            quiz_set_title=quiz_title,
+            question_text=item.get("question_text", "Untitled Question"),
+            options=item.get("options", {"A": "Option A", "B": "Option B", "C": "Option C", "D": "Option D"}),
+            correct_option=item.get("correct_option", "A").upper(),
+            topic=quiz_title,
+            main_category="AI MCQs",
+            sub_category=source_book_name,
+            explanation_markdown=explanation_txt,
+            status="ready",
+        )
+        db.add(mcq)
+        created_mcqs.append(mcq)
+
+    db.commit()
+
+    return {
+        "quiz_set_id": quiz_set_id,
+        "quiz_set_title": quiz_title,
+        "total_questions": len(created_mcqs),
+        "mcqs": [
+            {
+                "id": m.id,
+                "question_text": m.question_text,
+                "options": m.options,
+                "correct_option": m.correct_option,
+                "topic": m.topic,
+                "explanation_markdown": m.explanation_markdown,
+            }
+            for m in created_mcqs
+        ],
+    }
+
+
+@app.get("/api/chat/ai-quizzes")
+def get_ai_quizzes_history(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Returns list of distinct AI-generated quiz sets for user history."""
+    results = (
+        db.query(
+            MCQ.quiz_set_id,
+            MCQ.quiz_set_title,
+            func.count(MCQ.id).label("question_count"),
+            func.max(MCQ.topic).label("topic"),
+        )
+        .filter(MCQ.quiz_set_id != None)
+        .group_by(MCQ.quiz_set_id, MCQ.quiz_set_title)
+        .order_by(func.max(MCQ.id).desc())
+        .all()
+    )
+
+    return [
+        {
+            "quiz_set_id": r.quiz_set_id,
+            "quiz_set_title": r.quiz_set_title or "AI Quiz Set",
+            "question_count": r.question_count,
+            "topic": r.topic,
+        }
+        for r in results
+    ]
+
+
+@app.delete("/api/chat/ai-quizzes/{quiz_set_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_ai_quiz_set(
+    quiz_set_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Deletes all MCQs in a specific AI quiz set."""
+    db.query(MCQ).filter(MCQ.quiz_set_id == quiz_set_id).delete(synchronize_session=False)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 # ─── Practice Quiz Management (Phase 11) ───────────────────────
 
 class StartQuizRequest(BaseModel):
+    quiz_set_id: str | None = None
     categories: list[str] | None = None
     sub_categories: list[str] | None = None
     num_questions: int = 10
@@ -499,7 +709,9 @@ def start_quiz_endpoint(
     query = db.query(MCQ)
     
     # Topic filters
-    if req.sub_categories:
+    if req.quiz_set_id:
+        query = query.filter(MCQ.quiz_set_id == req.quiz_set_id)
+    elif req.sub_categories:
         query = query.filter(MCQ.sub_category.in_(req.sub_categories))
     elif req.categories:
         query = query.filter(MCQ.main_category.in_(req.categories))

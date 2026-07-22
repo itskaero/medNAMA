@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useCallback } from "react";
+import { toast } from "sonner";
 import { API } from "@/lib/constants";
 
 interface UseBookmarksParams {
@@ -100,9 +101,9 @@ export function useBookmarks({ token }: UseBookmarksParams) {
         .then((res) => {
           if (res.ok) {
             fetchBookmarks();
-            alert("Concept bookmarked successfully!");
+            toast.success("Concept bookmarked successfully!");
           } else {
-            alert("Failed to bookmark concept.");
+            toast.error("Failed to bookmark concept.", { duration: Infinity });
           }
         })
         .catch((err) => console.error(err));

@@ -1,7 +1,8 @@
 "use client";
 
 import React from "react";
-import { Stethoscope, AlertCircle } from "lucide-react";
+import { Stethoscope, AlertCircle, Pill, Clipboard, SquareActivity } from "lucide-react";
+import { motion, AnimatePresence } from "framer-motion";
 
 interface AuthCardProps {
   isRegisterMode: boolean;
@@ -31,126 +32,128 @@ export default function AuthCard({
   handleAuthSubmit,
 }: AuthCardProps) {
   return (
-    <div className="auth-shell">
-      <div className="auth-card" role="main">
-        <div className="auth-logo">
-          <div className="auth-brand-mark" aria-hidden>
-            <Stethoscope size={26} />
-          </div>
-          <div>
-            <h1 className="auth-title">
-              med<span>NAMA</span>
-            </h1>
-            <p className="auth-subtitle">
-              {isRegisterMode
-                ? "Create your clinical workspace account"
-                : "Sign in to access your medical knowledge base"}
-            </p>
-          </div>
+    <div className="auth-split-layout">
+      {/* Left Illustration Side */}
+      <div className="auth-visual-panel">
+        <div className="auth-brand-logo">
+          <Stethoscope size={28} />
+          <span>med<b style={{ color: "var(--sky)" }}>NAMA</b></span>
         </div>
+        
+        {/* Floating Icons */}
+        <div className="floating-icons-container">
+          <div className="float-icon float-1"><Stethoscope size={48} /></div>
+          <div className="float-icon float-2"><SquareActivity size={56} /></div>
+          <div className="float-icon float-3"><Pill size={44} /></div>
+          <div className="float-icon float-4"><Clipboard size={50} /></div>
+        </div>
+      </div>
 
-        {authError && (
-          <div className="auth-error" role="alert">
-            <AlertCircle size={14} />
-            {authError}
-          </div>
-        )}
-
-        <form onSubmit={handleAuthSubmit} noValidate>
-          <div className="field">
-            <label className="field-label" htmlFor="auth-username">
-              Username
-            </label>
-            <input
-              id="auth-username"
-              type="text"
-              className="field-input"
-              placeholder="Enter your username"
-              value={authUsername}
-              onChange={(e) => setAuthUsername(e.target.value)}
-              autoComplete="username"
-              required
-            />
-          </div>
-          <div className="field">
-            <label className="field-label" htmlFor="auth-password">
-              Password
-            </label>
-            <input
-              id="auth-password"
-              type="password"
-              className="field-input"
-              placeholder="Enter your password"
-              value={authPassword}
-              onChange={(e) => setAuthPassword(e.target.value)}
-              autoComplete={isRegisterMode ? "new-password" : "current-password"}
-              required
-            />
-          </div>
-          <button type="submit" className="btn-primary" disabled={isAuthLoading}>
-            {isAuthLoading
-              ? "Authenticating…"
-              : isRegisterMode
-              ? "Create account"
-              : "Sign in"}
-          </button>
-        </form>
-
-        {!isRegisterMode && (
-          <div className="quick-creds">
-            <div className="quick-creds-label">Quick start credentials</div>
-            <div className="quick-creds-row">
-              <button
-                className="quick-cred-btn"
-                type="button"
-                onClick={() => {
-                  setAuthUsername("admin");
-                  setAuthPassword("admin123");
-                }}
-              >
-                Admin
-              </button>
-              <button
-                className="quick-cred-btn"
-                type="button"
-                onClick={() => {
-                  setAuthUsername("student");
-                  setAuthPassword("student123");
-                }}
-              >
-                Student
-              </button>
+      {/* Right Form Side */}
+      <div className="auth-form-panel">
+        <div className="auth-form-container">
+          {/* Mobile Brand Header */}
+          <div className="auth-mobile-header">
+            <div className="auth-mobile-logo-mark">
+              <Stethoscope size={24} />
             </div>
+            <span className="auth-mobile-logo-text">med<b>NAMA</b></span>
           </div>
-        )}
 
-        <div className="auth-switch">
-          {isRegisterMode ? (
-            <>
-              Already have an account?{" "}
-              <button
-                className="auth-switch-btn"
-                type="button"
-                onClick={() => setIsRegisterMode(false)}
-              >
-                Sign in
-              </button>
-            </>
-          ) : (
-            <>
-              New to medNAMA?{" "}
-              <button
-                className="auth-switch-btn"
-                type="button"
-                onClick={() => {
-                  setIsRegisterMode(true);
-                  setAuthRole("student");
-                }}
-              >
-                Create account
-              </button>
-            </>
-          )}
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={isRegisterMode ? "register" : "login"}
+              initial={{ opacity: 0, y: 12, filter: "blur(4px)" }}
+              animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+              exit={{ opacity: 0, y: -12, filter: "blur(4px)" }}
+              transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
+            >
+              <h1 className="auth-title-new">
+                {isRegisterMode ? "Create an account" : "Welcome back!"}
+              </h1>
+              <p className="auth-subtitle-new">
+                {isRegisterMode
+                  ? "Join the premier clinical knowledge workspace."
+                  : "Sign in to access your medical knowledge base."}
+              </p>
+
+              {authError && (
+                <div className="auth-error" role="alert">
+                  <AlertCircle size={14} />
+                  {authError}
+                </div>
+              )}
+
+              <form onSubmit={handleAuthSubmit} noValidate className="auth-form-fields">
+                <div className="field">
+                  <label className="field-label" htmlFor="auth-username">
+                    Username
+                  </label>
+                  <input
+                    id="auth-username"
+                    type="text"
+                    className="field-input-new"
+                    placeholder="Enter your username"
+                    value={authUsername}
+                    onChange={(e) => setAuthUsername(e.target.value)}
+                    autoComplete="username"
+                    required
+                  />
+                </div>
+                <div className="field">
+                  <label className="field-label" htmlFor="auth-password">
+                    Password
+                  </label>
+                  <input
+                    id="auth-password"
+                    type="password"
+                    className="field-input-new"
+                    placeholder="Enter your password"
+                    value={authPassword}
+                    onChange={(e) => setAuthPassword(e.target.value)}
+                    autoComplete={isRegisterMode ? "new-password" : "current-password"}
+                    required
+                  />
+                </div>
+                <button type="submit" className="btn-primary-new" disabled={isAuthLoading}>
+                  {isAuthLoading
+                    ? "Authenticating…"
+                    : isRegisterMode
+                    ? "Create account"
+                    : "Sign in"}
+                </button>
+              </form>
+
+              <div className="auth-switch-new">
+                {isRegisterMode ? (
+                  <>
+                    Already have an account?{" "}
+                    <button
+                      className="auth-switch-btn-new"
+                      type="button"
+                      onClick={() => setIsRegisterMode(false)}
+                    >
+                      Sign in
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    New to medNAMA?{" "}
+                    <button
+                      className="auth-switch-btn-new"
+                      type="button"
+                      onClick={() => {
+                        setIsRegisterMode(true);
+                        setAuthRole("student");
+                      }}
+                    >
+                      Create account
+                    </button>
+                  </>
+                )}
+              </div>
+            </motion.div>
+          </AnimatePresence>
         </div>
       </div>
     </div>

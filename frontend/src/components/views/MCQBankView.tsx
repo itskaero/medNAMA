@@ -58,10 +58,6 @@ export default function MCQBankView({
         }}
       >
         <div>
-          <div className="dashboard-eyebrow">
-            <BookMarked size={12} style={{ marginRight: 6 }} />
-            Clinical Question Bank
-          </div>
           <h1 className="dashboard-title">MCQ Bank</h1>
         </div>
 

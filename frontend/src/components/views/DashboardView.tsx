@@ -35,10 +35,7 @@ export default function DashboardView({
   return (
     <div className="dashboard-view" role="region" aria-label="Dashboard metrics">
       <div className="dashboard-header">
-        <div className="dashboard-eyebrow">
-          <Stethoscope size={12} style={{ marginRight: 6 }} />
-          Clinical Intelligence Hub
-        </div>
+
         <h1 className="dashboard-title">
           Welcome back, <span>Dr. {username}</span>
         </h1>
@@ -83,10 +80,6 @@ export default function DashboardView({
       {/* Workspace Cards */}
       <div className="workspace-section">
         <div className="workspace-card">
-          <div className="workspace-badge">
-            <MessageSquare size={10} style={{ marginRight: 4 }} />
-            Diagnostic Search
-          </div>
           <h3 className="workspace-title">Textbook Q&A Engine</h3>
           <p className="workspace-desc">
             Ask complex clinical questions and retrieve grounded answers verified by cross-referencing all
@@ -98,10 +91,6 @@ export default function DashboardView({
         </div>
 
         <div className="workspace-card quiz-card">
-          <div className="workspace-badge">
-            <GraduationCap size={10} style={{ marginRight: 4 }} />
-            Adaptive Practice
-          </div>
           <h3 className="workspace-title">Practice Exam Center</h3>
           <p className="workspace-desc">
             Self-assess your clinical knowledge across our database of 12,000+ board exam questions. Access

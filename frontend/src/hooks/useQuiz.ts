@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
+import { toast } from "sonner";
 import { AnswerResponse } from "@/types";
 import { API } from "@/lib/constants";
 import { formatTime } from "@/utils/quizHelpers";
@@ -59,9 +60,15 @@ export function useQuiz({
   const [explanationLoading, setExplanationLoading] = useState(false);
   const [explanationError, setExplanationError] = useState<string | null>(null);
 
+  const isReviewNavigation = useRef(false);
+
   // Reset quiz state on entering quiz view
   useEffect(() => {
     if (activeView === "quiz") {
+      if (isReviewNavigation.current) {
+        isReviewNavigation.current = false;
+        return;
+      }
       setQuizStep("config");
       setQuizSelectedAnswers({});
       setQuizCurrentIdx(0);
@@ -150,8 +157,11 @@ export function useQuiz({
       setQuizStep("summary");
       setSummaryReviewIdx(0);
       fetchStats();
+      toast.success("Practice Session Completed!", {
+        description: "Your performance score and explanations are ready for review.",
+      });
     } catch (err: any) {
-      alert(err.message || "Failed to submit answers.");
+      toast.error(err.message || "Failed to submit answers.", { duration: Infinity });
       setQuizTimerActive(true);
     } finally {
       setQuizIsSubmitting(false);
@@ -167,7 +177,7 @@ export function useQuiz({
           if (prev <= 1) {
             clearInterval(interval);
             if (quizConfigTimerMode === "session") {
-              alert("Time is up! Your practice session is being submitted.");
+              toast.warning("Time is up! Your practice session is being submitted.");
               handleSubmitQuiz();
             } else if (quizConfigTimerMode === "per_question") {
               const nextIdx = quizCurrentIdx + 1;
@@ -178,7 +188,7 @@ export function useQuiz({
                 setIsCorrectSelection(null);
                 return quizConfigTimerValue;
               } else {
-                alert("Time is up for the final question! Submitting your answers.");
+                toast.warning("Time is up for the final question! Submitting your answers.");
                 handleSubmitQuiz();
               }
             }
@@ -255,8 +265,11 @@ export function useQuiz({
         setQuizTimerCountdown(0);
       }
       setQuizTimerActive(true);
+      toast.success("Practice Exam Started", {
+        description: `${data.mcqs.length} board-style MCQs loaded into session.`,
+      });
     } catch (err: any) {
-      alert(err.message || "Failed to generate quiz attempt.");
+      toast.error(err.message || "Failed to generate quiz attempt.", { duration: Infinity });
     } finally {
       setQuizIsLoading(false);
     }
@@ -284,9 +297,10 @@ export function useQuiz({
       setQuizSecondsElapsed(0);
       setQuizTimerActive(false);
       setQuizStep("summary");
+      isReviewNavigation.current = true;
       setActiveView("quiz");
     } catch (err: any) {
-      alert(err.message || "Failed to load quiz attempt details.");
+      toast.error(err.message || "Failed to load quiz attempt details.", { duration: Infinity });
     } finally {
       setQuizIsLoading(false);
     }
@@ -357,8 +371,51 @@ export function useQuiz({
     };
   }, [activeView, quizStep, quizCurrentIdx, quizMCQs, quizSelectedAnswers, quizIsSubmitting, explanationMCQId]);
 
+  // Launch custom AI-generated quiz set
+  const startAiCustomQuiz = async (quizSetId: string) => {
+    setQuizIsLoading(true);
+    try {
+      const res = await fetch(`${API}/api/quizzes/start`, {
+        method: "POST",
+        headers: {
+          ...getHeaders(),
+          "Content-Type": "application/json",
+        },
+        credentials: "include",
+        body: JSON.stringify({
+          quiz_set_id: quizSetId,
+          num_questions: 25,
+          timer_mode: "none",
+          timer_value: 0,
+          exclude_mastered: false,
+          feedback_mode: "tutor",
+        }),
+      });
+      if (!res.ok) {
+        const d = await res.json();
+        throw new Error(d.detail || "Failed to start custom quiz session.");
+      }
+      const data = await res.json();
+      setQuizMCQs(data.mcqs);
+      setQuizAttemptId(data.quiz_attempt_id);
+      setQuizCurrentIdx(0);
+      setQuizSelectedAnswers({});
+      setQuizStep("taker");
+      setQuizSecondsElapsed(0);
+      setQuizTimerActive(true);
+      setActiveView("quiz");
+      toast.success("AI Practice Quiz Initialized", {
+        description: `${data.mcqs.length} custom MCQs prepared for your practice session.`,
+      });
+    } catch (err: any) {
+      toast.error(err.message || "Failed to start quiz.", { duration: Infinity });
+    } finally {
+      setQuizIsLoading(false);
+    }
+  };
+
   return {
-    // quiz flow
+    // core
     quizStep,
     setQuizStep,
     quizMCQs,
@@ -409,6 +466,7 @@ export function useQuiz({
     explanationError,
     // handlers
     handleStartQuiz,
+    startAiCustomQuiz,
     handleSubmitQuiz,
     handleSelectOption,
     handleReviewPreviousQuiz,

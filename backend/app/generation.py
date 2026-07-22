@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.retrieval import retrieval_service
+from app.models import Book
 
 logger = logging.getLogger(__name__)
 
@@ -139,15 +140,14 @@ def generate_answer(
     keyword_results = retrieval_service.keyword_search(session, query, limit=10)
 
     confidence = retrieval_service.calculate_confidence(vector_results, keyword_results)
-    if confidence < confidence_threshold:
-        logger.info(f"Retrieval confidence too low ({confidence:.4f} < {confidence_threshold}). Returning fallback.")
-        return NOT_COVERED_RESPONSE
-
+    
     # 2. Hybrid Retrieval
     chunks = retrieval_service.hybrid_search(session, query, limit=5)
-    if not chunks:
-        logger.info(f"No chunks retrieved for query '{query}'. Returning fallback.")
-        return NOT_COVERED_RESPONSE
+
+    has_medical_context = (confidence >= confidence_threshold) and bool(chunks)
+    if not has_medical_context:
+        logger.info(f"Retrieval confidence low ({confidence:.4f}) or no chunks found for query '{query}'. Empty context will be passed.")
+        chunks = [] # Clear any weak matches so LLM doesn't hallucinate
 
     # 3. Fetch Linked Figures
     figures_map = retrieval_service.retrieve_figures_for_chunks(session, chunks)
@@ -171,7 +171,7 @@ def generate_answer(
             f"  Chapter: {c.chapter or 'N/A'}\n"
             f"  Text Content: {c.content}\n"
         )
-    formatted_context = "\n---\n".join(context_chunks)
+    formatted_context = "\n---\n".join(context_chunks) if context_chunks else "NO MEDICAL CONTEXT FOUND FOR THIS QUERY."
 
     formatted_figures = []
     for fig in all_figures:
@@ -181,20 +181,27 @@ def generate_answer(
             f"  Page: {fig['page_number']}\n"
             f"  Description: {fig['caption'] or 'Image extracted (no description available)'}\n"
         )
-    formatted_figs_str = "\n---\n".join(formatted_figures) if formatted_figures else "No figures available for these pages."
+    formatted_figs_str = "\n---\n".join(formatted_figures) if formatted_figures else "No figures available."
+
+    # 4b. Fetch loaded books list
+    all_books = session.query(Book).all()
+    book_titles = [b.title for b in all_books]
+    books_str = ", ".join(book_titles) if book_titles else "No books currently loaded."
 
     # 5. Build DeepSeek System Prompt
     system_prompt = (
-        "You are an expert medical AI assistant. Your task is to answer the user's medical question "
-        "based ONLY on the provided textbook context and figures. Do not use outside medical knowledge.\n\n"
+        "You are Dr. MedNama, an expert medical AI assistant. Your task is to answer the user's question.\n\n"
+        "BOOKS AVAILABLE IN SYSTEM:\n"
+        f"{books_str}\n\n"
         "GROUNDING RULES:\n"
-        "1. Answer strictly based on the facts provided in the chunks. If the answer cannot be found "
-        "in the context, return the standard fallback answer: 'I am sorry, but the answer to your question "
-        "is not covered in the provided textbooks.'\n"
-        "2. Do not invent any facts, book titles, page numbers, or figure descriptions.\n"
-        "3. Every assertion must be cited inline by referencing the exact book title and page number, e.g. "
-        "[Microbiology Sample, Page 8].\n"
-        "4. If a diagram figure from the provided figures list is directly relevant, describe it briefly and "
+        "1. Answer MEDICAL questions strictly based on the facts provided in the RETRIEVED TEXT CONTEXT. "
+        "If the user asks a medical question and the context says 'NO MEDICAL CONTEXT FOUND' or the answer cannot be found in the context, "
+        "you MUST return this EXACT fallback answer: 'I am sorry, but the answer to your question is not covered in the provided textbooks.'\n"
+        "2. If the user asks a CONVERSATIONAL query (e.g. 'hi', 'how are you') or asks about the SYSTEM or BOOKS (e.g. 'how many books do you have', 'what topics can I prepare for'), "
+        "you may answer naturally and helpfully as Dr. MedNama. Do NOT proactively list all the books you have access to unless the user explicitly asks for them. Do NOT hallucinate medical facts.\n"
+        "3. For medical answers, do not invent any facts, book titles, page numbers, or figure descriptions.\n"
+        "4. Every medical assertion must be cited inline by referencing the exact book title and page number, e.g. [Microbiology Sample, Page 8].\n"
+        "5. If a diagram figure from the provided figures list is directly relevant, describe it briefly and "
         "refer to it using its label (e.g. [Figure 2]) and associate it in the 'figures' JSON key.\n\n"
         "You must respond in valid JSON format only, matching this structure:\n"
         "{\n"

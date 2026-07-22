@@ -37,3 +37,5 @@ export interface Message {
   query?: string;
   timestamp?: string;
 }
+
+export type ActiveView = "chat" | "dashboard" | "mcq-bank" | "bookmarks" | "quiz" | "stats" | "reader";

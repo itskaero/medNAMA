@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useCallback, useEffect, useRef } from "react";
+import { toast } from "sonner";
 import { Book } from "@/types";
 import { API } from "@/lib/constants";
 
@@ -48,7 +49,8 @@ export function useLibrary({ token, getHeaders, handleLogout }: UseLibraryParams
     setUploadError(null);
     const formData = new FormData();
     formData.append("file", file);
-    try {
+
+    const uploadPromise = async () => {
       const res = await fetch(`${API}/api/ingest`, {
         method: "POST",
         headers: getHeaders(),
@@ -61,6 +63,18 @@ export function useLibrary({ token, getHeaders, handleLogout }: UseLibraryParams
       }
       if (fileRef.current) fileRef.current.value = "";
       await fetchBooks(false);
+    };
+
+    const promise = uploadPromise();
+
+    toast.promise(promise, {
+      loading: "Ingesting medical textbook...",
+      success: "Textbook ingested successfully!",
+      error: (err) => `Ingestion failed: ${err.message}`,
+    });
+
+    try {
+      await promise;
     } catch (err: any) {
       setUploadError(err.message || "Upload failed.");
     } finally {
@@ -76,10 +90,14 @@ export function useLibrary({ token, getHeaders, handleLogout }: UseLibraryParams
         headers: getHeaders(),
         credentials: "include",
       });
-      if (res.ok) setBooks((prev) => prev.filter((b) => b.id !== bookId));
-      else alert("Failed to delete book.");
+      if (res.ok) {
+        setBooks((prev) => prev.filter((b) => b.id !== bookId));
+        toast.success("Book deleted successfully.");
+      } else {
+        toast.error("Failed to delete book.", { duration: Infinity });
+      }
     } catch {
-      alert("Network error.");
+      toast.error("Network error.", { duration: Infinity });
     }
   };
 

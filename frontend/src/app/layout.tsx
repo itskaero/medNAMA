@@ -16,6 +16,8 @@ export const viewport: Viewport = {
   initialScale: 1,
 };
 
+import { Toaster } from "@/components/ui/sonner";
+
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -27,7 +29,10 @@ export default function RootLayout({
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
       </head>
-      <body style={{ height: "100%" }}>{children}</body>
+      <body style={{ height: "100%" }}>
+        {children}
+        <Toaster position="top-center" />
+      </body>
     </html>
   );
 }

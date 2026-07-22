@@ -8,12 +8,36 @@ import {
   Check,
   X,
   Bookmark,
+  Sparkles,
+  Zap,
+  HeartPulse,
+  Wind,
+  Brain,
+  MessageSquare,
+  Send,
+  Stethoscope,
+  Plus,
+  Play,
+  FileText,
+  Trash2,
+  ChevronUp,
+  ChevronDown,
+  Search,
+  BookOpen,
+  HelpCircle,
+  ArrowRight,
+  ArrowLeft,
+  AlertTriangle,
 } from "lucide-react";
-import { AnswerResponse, Figure } from "@/types";
+import { motion, AnimatePresence } from "framer-motion";
+import { AnswerResponse, Figure, Book } from "@/types";
+import { API } from "@/lib/constants";
+import { toast } from "sonner";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Switch } from "@/components/ui/switch";
 import { Slider } from "@/components/ui/slider";
 import ExplanationPanel from "@/components/ExplanationPanel";
+import BasicDropdown from "@/components/ui/basic-dropdown";
 
 interface QuizViewProps {
   // quiz flow
@@ -74,6 +98,35 @@ interface QuizViewProps {
   toggleBookmarkMCQ: (mcqId: number) => void;
   setActiveView: (view: any) => void;
   onFigureClick: (fig: Figure) => void;
+  books?: Book[];
+  getHeaders?: () => HeadersInit;
+  startAiCustomQuiz?: (quizSetId: string) => Promise<void>;
+}
+
+interface AiQuizSetSummary {
+  quiz_set_id: string;
+  quiz_set_title: string;
+  question_count: number;
+  topic: string;
+}
+
+interface StudioMessage {
+  id: string;
+  sender: "user" | "ai";
+  content?: string;
+  quizResult?: {
+    quiz_set_id: string;
+    quiz_set_title: string;
+    total_questions: number;
+    mcqs: Array<{
+      id: number;
+      question_text: string;
+      options: Record<string, string>;
+      correct_option: string;
+      explanation_markdown?: string;
+    }>;
+  };
+  timestamp: string;
 }
 
 export default function QuizView({
@@ -126,7 +179,205 @@ export default function QuizView({
   toggleBookmarkMCQ,
   setActiveView,
   onFigureClick,
+  books = [],
+  getHeaders,
+  startAiCustomQuiz,
 }: QuizViewProps) {
+  // Segmented control and generation states inside QuizView
+  const [builderMode, setBuilderMode] = React.useState<"manual" | "ai_assistant" | "saved_history">("manual");
+  const [promptInput, setPromptInput] = React.useState("");
+  const [selectedBookId, setSelectedBookId] = React.useState<number | "all">("all");
+  const [isGenerating, setIsGenerating] = React.useState(false);
+  const [quizHistory, setQuizHistory] = React.useState<AiQuizSetSummary[]>([]);
+  const [isLoadingHistory, setIsLoadingHistory] = React.useState(false);
+  const [historySearch, setHistorySearch] = React.useState("");
+  const [expandedQuizId, setExpandedQuizId] = React.useState<string | null>(null);
+  const [showQuitModal, setShowQuitModal] = React.useState(false);
+
+  const suggestionChips = [
+    {
+      icon: Zap,
+      label: "5 MCQs from Guyton Page 120",
+      query: "5 MCQs from Guyton Page 120",
+    },
+    {
+      icon: HeartPulse,
+      label: "Cardiovascular Physiology Board Exam",
+      query: "Cardiovascular Physiology Board Exam",
+    },
+    {
+      icon: Wind,
+      label: "Pulmonary Gas Exchange & Ventilation",
+      query: "Pulmonary Gas Exchange & Ventilation",
+    },
+    {
+      icon: Brain,
+      label: "Central Nervous System Neuroanatomy",
+      query: "Central Nervous System Neuroanatomy",
+    },
+  ];
+
+  const filteredHistory = React.useMemo(() => {
+    if (!historySearch.trim()) return quizHistory;
+    const q = historySearch.toLowerCase();
+    return quizHistory.filter(
+      (item) =>
+        item.quiz_set_title.toLowerCase().includes(q) ||
+        (item.topic && item.topic.toLowerCase().includes(q))
+    );
+  }, [quizHistory, historySearch]);
+
+  const [studioMessages, setStudioMessages] = React.useState<StudioMessage[]>([
+    {
+      id: "welcome-1",
+      sender: "ai",
+      content:
+        "Welcome to AI Quiz Studio! Ask me to generate custom board-style MCQs from any textbook topic, chapter, or exact page number.",
+      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    },
+  ]);
+
+  const studioMessagesEndRef = React.useRef<HTMLDivElement>(null);
+
+  // Fetch AI quiz history
+  const fetchQuizHistory = async () => {
+    if (!token || !getHeaders) return;
+    setIsLoadingHistory(true);
+    try {
+      const res = await fetch(`${API}/api/chat/ai-quizzes`, {
+        headers: getHeaders(),
+        credentials: "include",
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setQuizHistory(data);
+      }
+    } catch (e) {
+      console.error("Failed to fetch quiz history:", e);
+    } finally {
+      setIsLoadingHistory(false);
+    }
+  };
+
+  React.useEffect(() => {
+    if (token && builderMode === "saved_history") {
+      fetchQuizHistory();
+    }
+  }, [token, builderMode]);
+
+  React.useEffect(() => {
+    if (builderMode === "ai_assistant") {
+      studioMessagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [studioMessages, isGenerating, builderMode]);
+
+  // Handle AI Quiz Generation inside config screen
+  const handleGenerate = async (customPrompt?: string) => {
+    const queryPrompt = customPrompt || promptInput;
+    if (!queryPrompt.trim()) {
+      toast.error("Please enter a topic or page prompt.");
+      return;
+    }
+    if (!getHeaders) return;
+
+    const timeStr = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const userMsgId = `user-${Date.now()}`;
+
+    setStudioMessages((prev) => [
+      ...prev,
+      {
+        id: userMsgId,
+        sender: "user",
+        content: queryPrompt,
+        timestamp: timeStr,
+      },
+    ]);
+
+    setPromptInput("");
+    setIsGenerating(true);
+
+    const generationPromise = (async () => {
+      const res = await fetch(`${API}/api/chat/generate-ai-quiz`, {
+        method: "POST",
+        headers: {
+          ...getHeaders(),
+          "Content-Type": "application/json",
+        },
+        credentials: "include",
+        body: JSON.stringify({
+          prompt: queryPrompt,
+          book_id: selectedBookId === "all" ? null : selectedBookId,
+        }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || "Failed to generate quiz.");
+      }
+
+      return await res.json();
+    })();
+
+    toast.promise(generationPromise, {
+      loading: "Generating board-style MCQs from textbook RAG context...",
+      success: (data) => {
+        fetchQuizHistory();
+        setStudioMessages((prev) => [
+          ...prev,
+          {
+            id: `ai-${Date.now()}`,
+            sender: "ai",
+            content: `I've generated **${data.quiz_set_title}** containing ${data.total_questions} board-style MCQs grounded directly in textbook RAG context!`,
+            quizResult: data,
+            timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+          },
+        ]);
+        return `Generated "${data.quiz_set_title}" (${data.total_questions} MCQs)!`;
+      },
+      error: (err) => {
+        setStudioMessages((prev) => [
+          ...prev,
+          {
+            id: `ai-err-${Date.now()}`,
+            sender: "ai",
+            content: `Sorry, I encountered an error while generating the quiz: ${err.message || "Failed to retrieve textbook context."}`,
+            timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+          },
+        ]);
+        return err.message || "An error occurred during quiz generation.";
+      },
+    });
+
+    try {
+      await generationPromise;
+    } catch {
+      // Handled by toast
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  // Handle Delete Quiz Set
+  const handleDeleteQuizSet = async (quizSetId: string, title: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!getHeaders) return;
+    try {
+      const res = await fetch(`${API}/api/chat/ai-quizzes/${quizSetId}`, {
+        method: "DELETE",
+        headers: getHeaders(),
+        credentials: "include",
+      });
+      if (res.ok) {
+        toast.success(`Deleted "${title}" quiz set.`);
+        fetchQuizHistory();
+      } else {
+        toast.error("Failed to delete quiz set.");
+      }
+    } catch {
+      toast.error("An error occurred during deletion.");
+    }
+  };
+
   // ─── Stage 1: Configure ───────────────────────────────────────────────────
   if (quizStep === "config") {
     const mainCategories = stats?.categories || [];
@@ -225,7 +476,7 @@ export default function QuizView({
             ? subCategoryOptions.length
             : totalSystemMCQs;
         if (activeSubCount === 0) {
-          alert("Please select at least one category or subtopic to proceed.");
+          toast.warning("Please select at least one category or subtopic to proceed.");
           return;
         }
         setQuizConfigStep(2);
@@ -249,10 +500,6 @@ export default function QuizView({
           style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}
         >
           <div>
-            <div className="dashboard-eyebrow">
-              <GraduationCap size={12} style={{ marginRight: 6 }} />
-              Practice Exam Center
-            </div>
             <h1 className="dashboard-title">Configure Practice Session</h1>
           </div>
           <button className="btn-workspace" onClick={() => setActiveView("dashboard")}>
@@ -316,76 +563,396 @@ export default function QuizView({
                 Select Practice Topics
               </h3>
               <p className="practice-subtitle" style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: "4px" }}>
-                Choose main subject categories and subtopics to customize your question mix.
+                Choose main subject categories, consult the AI Generator Assistant, or select a previously saved custom quiz.
               </p>
             </div>
 
-            <div style={{ display: "flex", flexDirection: "column", gap: "var(--sp-2)" }}>
-              <label style={{ fontSize: "0.72rem", fontWeight: 700, color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-                Main Categories
-              </label>
-              <div className="config-category-grid" role="group">
-                <button
-                  type="button"
-                  className={`config-category-card ${quizConfigCategories.length === 0 ? "active" : ""}`}
-                  onClick={() => { setQuizConfigCategories([]); setQuizConfigSubCategories([]); }}
-                >
-                  <span className="config-category-title">Mixed Practice (All)</span>
-                  <span className="config-category-subtitle">Select all ingested subjects</span>
-                </button>
-                {mainCategories.map((c: any, i: number) => {
-                  const count = c.sub_categories.reduce((sum: number, s: any) => sum + s.count, 0);
-                  const isSelected = quizConfigCategories.includes(c.main_category);
-                  return (
-                    <button
-                      key={i}
-                      type="button"
-                      className={`config-category-card ${isSelected ? "active" : ""}`}
-                      onClick={() => toggleCategory(c.main_category)}
-                    >
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%" }}>
-                        <span className="config-category-title" title={c.main_category}>{c.main_category}</span>
-                        <Checkbox checked={isSelected} readOnly />
-                      </div>
-                      <span className="config-category-subtitle">{c.sub_categories.length} subtopics · {count} MCQs</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div style={{ display: "flex", flexDirection: "column", gap: "var(--sp-2)" }}>
-              <label style={{ fontSize: "0.72rem", fontWeight: 700, color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-                Sub-Category Topics
-              </label>
-              <div className="config-sub-pills-list">
-                <button
-                  type="button"
-                  className={`config-sub-pill ${quizConfigSubCategories.length === 0 ? "active" : ""}`}
-                  onClick={() => setQuizConfigSubCategories([])}
-                >
-                  All Subtopics
-                </button>
-                {subCategoryOptions.map((s: any, i: number) => {
-                  const isSelected = quizConfigSubCategories.includes(s.name);
-                  return (
-                    <button
-                      key={i}
-                      type="button"
-                      className={`config-sub-pill ${isSelected ? "active" : ""}`}
-                      onClick={() => toggleSubCategory(s.name)}
-                    >
-                      {isSelected ? "✓ " : ""}{s.name} ({s.count})
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "var(--sp-4)" }}>
-              <button className="btn-primary" onClick={handleNextStep} style={{ padding: "8px 24px" }}>
-                Configure Session Rules →
+            {/* Segmented Control Mode Tabs */}
+            <div style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(3, 1fr)",
+              gap: "6px",
+              background: "var(--surface-2)",
+              border: "1px solid var(--border-light)",
+              borderRadius: "14px",
+              padding: "5px",
+              marginBottom: "24px",
+              width: "100%"
+            }}>
+              <button
+                type="button"
+                onClick={() => setBuilderMode("manual")}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: "8px",
+                  padding: "10px 12px",
+                  fontSize: "0.83rem",
+                  fontWeight: builderMode === "manual" ? 700 : 500,
+                  color: builderMode === "manual" ? "var(--sky)" : "var(--text-secondary)",
+                  background: builderMode === "manual" ? "var(--surface-1)" : "transparent",
+                  border: builderMode === "manual" ? "1px solid var(--sky)" : "1px solid transparent",
+                  borderRadius: "10px",
+                  cursor: "pointer",
+                  boxShadow: builderMode === "manual" ? "0 2px 10px rgba(48, 197, 255, 0.18)" : "none",
+                  transition: "all 0.2s ease"
+                }}
+              >
+                <Plus size={14} style={{ color: builderMode === "manual" ? "var(--sky)" : "var(--text-muted)" }} />
+                <span>Manual Builder</span>
               </button>
+
+              <button
+                type="button"
+                onClick={() => setBuilderMode("ai_assistant")}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: "8px",
+                  padding: "10px 12px",
+                  fontSize: "0.83rem",
+                  fontWeight: builderMode === "ai_assistant" ? 700 : 500,
+                  color: builderMode === "ai_assistant" ? "var(--sky)" : "var(--text-secondary)",
+                  background: builderMode === "ai_assistant" ? "var(--surface-1)" : "transparent",
+                  border: builderMode === "ai_assistant" ? "1px solid var(--sky)" : "1px solid transparent",
+                  borderRadius: "10px",
+                  cursor: "pointer",
+                  boxShadow: builderMode === "ai_assistant" ? "0 2px 10px rgba(48, 197, 255, 0.18)" : "none",
+                  transition: "all 0.2s ease"
+                }}
+              >
+                <Sparkles size={14} style={{ color: builderMode === "ai_assistant" ? "var(--sky)" : "var(--text-muted)" }} />
+                <span>AI MCQs</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setBuilderMode("saved_history")}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: "8px",
+                  padding: "10px 12px",
+                  fontSize: "0.83rem",
+                  fontWeight: builderMode === "saved_history" ? 700 : 500,
+                  color: builderMode === "saved_history" ? "var(--sky)" : "var(--text-secondary)",
+                  background: builderMode === "saved_history" ? "var(--surface-1)" : "transparent",
+                  border: builderMode === "saved_history" ? "1px solid var(--sky)" : "1px solid transparent",
+                  borderRadius: "10px",
+                  cursor: "pointer",
+                  boxShadow: builderMode === "saved_history" ? "0 2px 10px rgba(48, 197, 255, 0.18)" : "none",
+                  transition: "all 0.2s ease"
+                }}
+              >
+                <Clock size={14} style={{ color: builderMode === "saved_history" ? "var(--sky)" : "var(--text-muted)" }} />
+                <span>Quiz History</span>
+              </button>
+            </div>
+
+            {/* Mode Content Container with Fixed Min-Height & Transition Animations */}
+            <div style={{ minHeight: "440px", display: "flex", flexDirection: "column", position: "relative" }}>
+              <AnimatePresence mode="wait">
+                <motion.div
+                  key={builderMode}
+                  initial={{ opacity: 0, y: 8, filter: "blur(3px)" }}
+                  animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                  exit={{ opacity: 0, y: -8, filter: "blur(3px)" }}
+                  transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+                  style={{ flex: 1, display: "flex", flexDirection: "column" }}
+                >
+                  {/* Mode 1: Manual Builder */}
+                  {builderMode === "manual" && (
+                    <>
+                      <div style={{ display: "flex", flexDirection: "column", gap: "var(--sp-2)" }}>
+                        <label style={{ fontSize: "0.72rem", fontWeight: 700, color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                          Main Categories
+                        </label>
+                        <div className="config-category-grid" role="group">
+                          <button
+                            type="button"
+                            className={`config-category-card ${quizConfigCategories.length === 0 ? "active" : ""}`}
+                            onClick={() => { setQuizConfigCategories([]); setQuizConfigSubCategories([]); }}
+                          >
+                            <span className="config-category-title">Mixed Practice (All)</span>
+                            <span className="config-category-subtitle">Select all ingested subjects</span>
+                          </button>
+                          {mainCategories.map((c: any, i: number) => {
+                            const count = c.sub_categories.reduce((sum: number, s: any) => sum + s.count, 0);
+                            const isSelected = quizConfigCategories.includes(c.main_category);
+                            return (
+                              <button
+                                key={i}
+                                type="button"
+                                className={`config-category-card ${isSelected ? "active" : ""}`}
+                                onClick={() => toggleCategory(c.main_category)}
+                              >
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", width: "100%", gap: "12px" }}>
+                                  <span className="config-category-title" title={c.main_category} style={{ textAlign: "left", flex: 1 }}>{c.main_category}</span>
+                                  <div style={{ flexShrink: 0, marginTop: "2px" }}>
+                                    <Checkbox checked={isSelected} readOnly />
+                                  </div>
+                                </div>
+                                <span className="config-category-subtitle">{c.sub_categories.length} subtopics · {count} MCQs</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      <div style={{ display: "flex", flexDirection: "column", gap: "var(--sp-2)", marginTop: "24px" }}>
+                        <label style={{ fontSize: "0.72rem", fontWeight: 700, color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                          Sub-Category Topics
+                        </label>
+                        <div className="config-sub-pills-list">
+                          <button
+                            type="button"
+                            className={`config-sub-pill ${quizConfigSubCategories.length === 0 ? "active" : ""}`}
+                            onClick={() => setQuizConfigSubCategories([])}
+                          >
+                            All Subtopics
+                          </button>
+                          {subCategoryOptions.map((s: any, i: number) => {
+                            const isSelected = quizConfigSubCategories.includes(s.name);
+                            return (
+                              <button
+                                key={i}
+                                type="button"
+                                className={`config-sub-pill ${isSelected ? "active" : ""}`}
+                                onClick={() => toggleSubCategory(s.name)}
+                              >
+                                {isSelected ? "✓ " : ""}{s.name} ({s.count})
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "auto", paddingTop: "var(--sp-4)" }}>
+                        <button className="btn-primary" onClick={handleNextStep}>
+                          <span>Configure Session Rules</span>
+                          <ArrowRight size={16} style={{ marginLeft: "4px" }} />
+                        </button>
+                      </div>
+                    </>
+                  )}
+
+                  {/* Mode 2: AI Assistant Generator */}
+                  {builderMode === "ai_assistant" && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: "16px", minHeight: "400px", background: "var(--surface-1)", border: "1px solid var(--border-light)", borderRadius: "var(--r-xl)", padding: "16px", flex: 1 }}>
+                      {/* Chat Message Stream */}
+                      <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: "16px", maxHeight: "350px", minHeight: "220px", paddingRight: "4px" }}>
+                        {studioMessages.length === 1 ? (
+                          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center", padding: "24px 12px" }}>
+                            <h4 style={{ fontFamily: "var(--font-serif)", fontSize: "1.3rem", color: "var(--text-primary)", marginBottom: "8px" }}>
+                              Generate clinical board <em>quizzes</em>
+                            </h4>
+                            <p style={{ fontSize: "0.82rem", color: "var(--text-secondary)", maxWidth: "400px", lineHeight: "1.5", marginBottom: "20px" }}>
+                              Specify a page or topic to build board-style vignettes grounded in textbooks.
+                            </p>
+                            <div className="suggestion-grid" style={{ maxWidth: "540px", gridTemplateColumns: "1fr 1fr" }}>
+                              {suggestionChips.map((s, i) => {
+                                const Icon = s.icon;
+                                return (
+                                  <button
+                                    key={i}
+                                    type="button"
+                                    className="suggestion-chip"
+                                    onClick={() => {
+                                      setPromptInput(s.query);
+                                      handleGenerate(s.query);
+                                    }}
+                                    style={{ padding: "10px", fontSize: "0.78rem" }}
+                                  >
+                                    <Icon size={12} className="text-[var(--sky)] shrink-0" style={{ marginTop: "2px" }} />
+                                    <span style={{ textAlign: "left" }}>{s.label}</span>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="chat-message-thread" style={{ padding: 0 }}>
+                            {studioMessages.map((msg) =>
+                              msg.sender === "user" ? (
+                                <div key={msg.id} className="user-message" style={{ margin: "4px 0" }}>
+                                  <div className="user-bubble" style={{ padding: "10px 14px", fontSize: "0.85rem" }}>
+                                    <div>{msg.content}</div>
+                                    {msg.timestamp && (
+                                      <div style={{ fontSize: "0.62rem", opacity: 0.7, marginTop: "4px", textAlign: "right" }}>
+                                        {msg.timestamp}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              ) : (
+                                <div key={msg.id} className="ai-message" style={{ margin: "4px 0" }}>
+                                  <div className="ai-body">
+                                    <div className="ai-editorial-header" style={{ marginBottom: "6px" }}>
+                                      <Stethoscope size={12} className="ai-editorial-icon" />
+                                      <span className="ai-editorial-name">Dr. MedNama</span>
+                                    </div>
+                                    <div className="prose text-xs text-[var(--text-primary)] leading-relaxed">
+                                      <p>{msg.content}</p>
+                                    </div>
+
+                                    {msg.quizResult && (
+                                      <div className="workspace-card quiz-card" style={{ marginTop: "12px", background: "var(--surface-2)", border: "1px solid var(--border-light)", borderRadius: "var(--r-lg)", padding: "14px", display: "flex", flexDirection: "column", gap: "8px" }}>
+                                        <div className="flex justify-between items-start">
+                                          <div>
+                                            <div className="workspace-badge" style={{ display: "inline-flex", background: "var(--sky-dim)", color: "var(--sky)", fontSize: "0.65rem", padding: "1px 6px" }}>
+                                              {msg.quizResult.total_questions} MCQs Ready
+                                            </div>
+                                            <h4 style={{ fontSize: "0.9rem", fontWeight: 700, marginTop: "4px" }}>
+                                              {msg.quizResult.quiz_set_title}
+                                            </h4>
+                                          </div>
+                                        </div>
+
+                                        <div style={{ display: "flex", gap: "8px", marginTop: "4px" }}>
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              if (startAiCustomQuiz) {
+                                                startAiCustomQuiz(msg.quizResult!.quiz_set_id);
+                                              }
+                                            }}
+                                            className="btn-primary py-2 px-3 text-xs font-bold rounded-lg flex items-center gap-1"
+                                            style={{ minHeight: "36px" }}
+                                          >
+                                            <Play size={12} fill="currentColor" />
+                                            <span>Practice Now</span>
+                                          </button>
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              )
+                            )}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Chat Input */}
+                      <div className="chat-composer-box" style={{ padding: "8px 12px", background: "var(--surface-2)", borderRadius: "var(--r-md)", border: "1px solid var(--border-light)" }}>
+                        <textarea
+                          className="input-box"
+                          placeholder="Ask AI to generate MCQs from a textbook chapter..."
+                          rows={2}
+                          value={promptInput}
+                          onChange={(e) => setPromptInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" && !e.shiftKey) {
+                              e.preventDefault();
+                              handleGenerate();
+                            }
+                          }}
+                          style={{ minHeight: "44px", fontSize: "0.82rem", background: "transparent", border: "none" }}
+                        />
+
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "6px" }}>
+                          <div style={{ width: "200px" }}>
+                            <BasicDropdown
+                              items={[
+                                { value: "all", label: "All Books" },
+                                ...(books?.filter((b) => b.status === "ready").map((b) => ({
+                                  value: b.id.toString(),
+                                  label: b.title,
+                                })) || []),
+                              ]}
+                              value={selectedBookId.toString()}
+                              onChange={(val) => setSelectedBookId(val === "all" ? "all" : Number(val))}
+                              ariaLabel="Select book for mock quiz"
+                              dropUp={true}
+                            />
+                          </div>
+                          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                            <span className="keyboard-send-hint" style={{ fontSize: "0.68rem" }}>⏎ to generate</span>
+                            <button
+                              type="button"
+                              className="send-btn"
+                              onClick={() => handleGenerate()}
+                              disabled={isGenerating || !promptInput.trim()}
+                              style={{ width: "26px", height: "26px" }}
+                            >
+                              {isGenerating ? (
+                                <Loader2 size={12} className="animate-spin" />
+                              ) : (
+                                <Sparkles size={12} />
+                              )}
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Mode 3: Saved History */}
+                  {builderMode === "saved_history" && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: "12px", minHeight: "350px", background: "var(--surface-1)", border: "1px solid var(--border-light)", borderRadius: "var(--r-xl)", padding: "16px", flex: 1 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "8px", background: "var(--surface-2)", border: "1px solid var(--border-light)", borderRadius: "var(--r-md)", padding: "6px 12px" }}>
+                        <Search size={13} className="text-[var(--text-muted)]" />
+                        <input
+                          type="text"
+                          placeholder="Search saved custom sets..."
+                          value={historySearch}
+                          onChange={(e) => setHistorySearch(e.target.value)}
+                          style={{ background: "transparent", border: "none", fontSize: "0.78rem", color: "var(--text-primary)", outline: "none", width: "100%" }}
+                        />
+                      </div>
+
+                      <div style={{ display: "flex", flexDirection: "column", gap: "2px", overflowY: "auto", flex: 1, maxHeight: "300px" }}>
+                        {isLoadingHistory ? (
+                          <div className="chat-history-loading">Loading saved history...</div>
+                        ) : quizHistory.length === 0 ? (
+                          <div style={{ padding: "32px", textAlign: "center", color: "var(--text-muted)", fontSize: "0.82rem" }}>
+                            No saved custom quiz sets found.
+                          </div>
+                        ) : (
+                          filteredHistory.map((qSet) => (
+                            <div
+                              key={qSet.quiz_set_id}
+                              style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 12px", borderRadius: "var(--r-md)", background: "var(--surface-2)", border: "1px solid var(--border-light)" }}
+                            >
+                              <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
+                                <span style={{ fontWeight: 600, fontSize: "0.84rem", color: "var(--text-primary)" }}>{qSet.quiz_set_title}</span>
+                                <span style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>{qSet.question_count} MCQs · {qSet.topic || "Custom Quiz"}</span>
+                              </div>
+                              <div style={{ display: "flex", gap: "6px" }}>
+                                <button
+                                  type="button"
+                                  className="btn-primary"
+                                  style={{ padding: "4px 12px", fontSize: "0.75rem", minHeight: "30px" }}
+                                  onClick={() => {
+                                    if (startAiCustomQuiz) {
+                                      startAiCustomQuiz(qSet.quiz_set_id);
+                                    }
+                                  }}
+                                >
+                                  Practice
+                                </button>
+                                <button
+                                  type="button"
+                                  className="chat-delete-btn"
+                                  style={{ position: "static", transform: "none", opacity: 1, display: "inline-flex", alignItems: "center", justifyContent: "center", width: "28px", height: "28px", borderRadius: "6px", color: "var(--text-muted)", background: "none", border: "none", cursor: "pointer", alignSelf: "center" }}
+                                  onClick={(e) => handleDeleteQuizSet(qSet.quiz_set_id, qSet.quiz_set_title, e)}
+                                  title="Delete set"
+                                  aria-label="Delete custom set"
+                                >
+                                  <Trash2 size={12} />
+                                </button>
+                              </div>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </motion.div>
+              </AnimatePresence>
             </div>
           </div>
         )}
@@ -516,8 +1083,14 @@ export default function QuizView({
             </div>
 
             <div style={{ display: "flex", justifyContent: "space-between", marginTop: "var(--sp-4)" }}>
-              <button className="btn-workspace" onClick={handlePrevStep}>← Back to Topics</button>
-              <button className="btn-primary" onClick={handleNextStep} style={{ padding: "8px 24px" }}>Review Configuration →</button>
+              <button className="btn-workspace" onClick={handlePrevStep} style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+                <ArrowLeft size={16} />
+                <span>Back to Topics</span>
+              </button>
+              <button className="btn-primary" onClick={handleNextStep}>
+                <span>Review Configuration</span>
+                <ArrowRight size={16} style={{ marginLeft: "4px" }} />
+              </button>
             </div>
           </div>
         )}
@@ -550,9 +1123,19 @@ export default function QuizView({
               </div>
 
               <div style={{ display: "flex", justifyContent: "space-between", marginTop: "var(--sp-4)" }}>
-                <button className="btn-workspace" onClick={() => setQuizConfigStep(2)}>← Back to Rules</button>
-                <button className="btn-primary" disabled={quizIsLoading} onClick={handleStartQuiz} style={{ padding: "10px 32px", display: "flex", alignItems: "center", gap: "8px" }}>
-                  {quizIsLoading ? <Loader2 size={16} className="spinner" style={{ animation: "spin 1s linear infinite" }} /> : "Start Practice Exam"}
+                <button className="btn-workspace" onClick={() => setQuizConfigStep(2)} style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+                  <ArrowLeft size={16} />
+                  <span>Back to Rules</span>
+                </button>
+                <button className="btn-primary" disabled={quizIsLoading} onClick={handleStartQuiz} style={{ padding: "10px 28px" }}>
+                  {quizIsLoading ? (
+                    <Loader2 size={16} className="spinner" style={{ animation: "spin 1s linear infinite" }} />
+                  ) : (
+                    <>
+                      <span>Start Practice Exam</span>
+                      <ArrowRight size={16} style={{ marginLeft: "4px" }} />
+                    </>
+                  )}
                 </button>
               </div>
             </div>
@@ -613,8 +1196,7 @@ export default function QuizView({
     const liveAccuracy = answeredCount > 0 ? Math.round((currentCorrectCount / answeredCount) * 100) : 100;
 
     const handleQuitQuiz = () => {
-      const confirmQuit = window.confirm("Are you sure you want to quit this practice session? Your progress will not be saved.");
-      if (confirmQuit) setActiveView("dashboard");
+      setShowQuitModal(true);
     };
 
     return (
@@ -708,7 +1290,7 @@ export default function QuizView({
                       style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", textAlign: "left", animationDelay: `${index * 50}ms` }}>
                       <div style={{ display: "flex", alignItems: "center", gap: "12px", flex: 1 }}>
                         <span className="option-badge">{key}</span>
-                        <span style={{ lineHeight: 1.4 }}>{currentMCQ.options[key]}</span>
+                        <span style={{ lineHeight: 1.4, color: "var(--text-primary)" }}>{currentMCQ.options[key]}</span>
                       </div>
                       {isAnswered && isCorrect && quizConfigFeedbackMode !== "board" && <Check size={14} style={{ color: "var(--success)", flexShrink: 0, marginLeft: "8px" }} />}
                       {isAnswered && isSelected && !isCorrect && quizConfigFeedbackMode !== "board" && <X size={14} style={{ color: "var(--error)", flexShrink: 0, marginLeft: "8px" }} />}
@@ -746,6 +1328,73 @@ export default function QuizView({
 
           <ExplanationPanel explanationMCQId={explanationMCQId} setExplanationMCQId={setExplanationMCQId} explanationLoading={explanationLoading} explanationError={explanationError} explanationData={explanationData} token={token} onFigureClick={onFigureClick} />
         </div>
+
+        {/* Custom Quit Confirmation Modal */}
+        <AnimatePresence>
+          {showQuitModal && (
+            <div className="modal-backdrop" onClick={() => setShowQuitModal(false)}>
+              <motion.div
+                className="modal-panel"
+                style={{ maxWidth: "440px", padding: "24px", borderRadius: "16px" }}
+                initial={{ opacity: 0, scale: 0.95, y: 10 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.95, y: 10 }}
+                transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "14px" }}>
+                  <div style={{ width: "40px", height: "40px", borderRadius: "12px", background: "rgba(239, 68, 68, 0.12)", border: "1px solid rgba(239, 68, 68, 0.3)", display: "flex", alignItems: "center", justifyContent: "center", color: "#ef4444", flexShrink: 0 }}>
+                    <AlertTriangle size={20} />
+                  </div>
+                  <div>
+                    <h3 style={{ fontSize: "1.05rem", fontWeight: 700, color: "var(--text-primary)" }}>Quit Practice Session?</h3>
+                    <p style={{ fontSize: "0.78rem", color: "var(--text-muted)", marginTop: "2px" }}>Confirmation required</p>
+                  </div>
+                </div>
+
+                <p style={{ fontSize: "0.86rem", color: "var(--text-secondary)", lineHeight: "1.5", marginBottom: "20px" }}>
+                  Are you sure you want to exit? Your current progress and unanswered questions in this practice exam will be lost.
+                </p>
+
+                <div style={{ display: "flex", gap: "10px", justifyContent: "flex-end" }}>
+                  <button
+                    type="button"
+                    className="btn-workspace"
+                    onClick={() => setShowQuitModal(false)}
+                    style={{ padding: "8px 16px", fontSize: "0.84rem" }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowQuitModal(false);
+                      setQuizStep("config");
+                      setActiveView("dashboard");
+                      toast.info("Practice Session Exited", {
+                        description: "Your session was ended and progress reset.",
+                      });
+                    }}
+                    style={{
+                      padding: "8px 18px",
+                      fontSize: "0.84rem",
+                      fontWeight: 600,
+                      background: "#dc2626",
+                      color: "#ffffff",
+                      border: "none",
+                      borderRadius: "var(--r-md)",
+                      cursor: "pointer",
+                      boxShadow: "0 4px 12px rgba(220, 38, 38, 0.3)",
+                      transition: "transform 0.15s ease",
+                    }}
+                  >
+                    Yes, Exit Session
+                  </button>
+                </div>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
       </div>
     );
   }

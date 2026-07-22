@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { Stethoscope, Menu } from "lucide-react";
+import { motion, AnimatePresence } from "framer-motion";
 
 import { Figure } from "../types";
 
@@ -301,6 +302,8 @@ export default function Home() {
           toggleBookmarkMCQ={toggleBookmarkMCQ}
           setActiveView={setActiveView}
           onFigureClick={setLightboxFig}
+          books={books}
+          getHeaders={getHeaders}
         />
       );
     }
@@ -464,7 +467,18 @@ export default function Home() {
 
       {/* ── Main content ── */}
       <main className="main" aria-label="Medical knowledge assistant">
-        {renderMainContent()}
+        <AnimatePresence mode="wait">
+          <motion.div
+            key={activeView}
+            initial={{ opacity: 0, y: 15 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -15 }}
+            transition={{ duration: 0.25, ease: "easeOut" }}
+            style={{ width: "100%", height: "100%", overflowY: "auto", overflowX: "hidden" }}
+          >
+            {renderMainContent()}
+          </motion.div>
+        </AnimatePresence>
       </main>
 
       {/* ── Figure lightbox ── */}

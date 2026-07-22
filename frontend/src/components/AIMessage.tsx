@@ -74,14 +74,16 @@ export function AIMessage({
               className="prose"
               dangerouslySetInnerHTML={{ __html: parseMarkdown(msg.answer.answer_markdown) }}
             />
+            
+            <FiguresDrawer
+              figures={msg.answer.figures}
+              token={token}
+              onFigureClick={onFigureClick}
+            />
+
             <div className="answer-footer" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%", marginTop: "var(--sp-4)" }}>
               <div style={{ display: "flex", gap: "var(--sp-2)", flexWrap: "wrap" }}>
                 <CitationsDrawer citations={msg.answer.citations} token={token} />
-                <FiguresDrawer
-                  figures={msg.answer.figures}
-                  token={token}
-                  onFigureClick={onFigureClick}
-                />
               </div>
               
               <div style={{ display: "flex", alignItems: "center", gap: "var(--sp-3)" }}>

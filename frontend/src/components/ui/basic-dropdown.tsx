@@ -16,6 +16,7 @@ export interface BasicDropdownProps {
   className?: string;
   style?: React.CSSProperties;
   ariaLabel?: string;
+  dropUp?: boolean;
 }
 
 const BasicDropdown: React.FC<BasicDropdownProps> = ({
@@ -24,7 +25,8 @@ const BasicDropdown: React.FC<BasicDropdownProps> = ({
   onChange,
   className,
   style,
-  ariaLabel
+  ariaLabel,
+  dropUp = false,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [focusedIndex, setFocusedIndex] = useState(-1);
@@ -159,7 +161,7 @@ const BasicDropdown: React.FC<BasicDropdownProps> = ({
           role="listbox"
           style={{
             position: 'absolute',
-            top: 'calc(100% + 4px)',
+            ...(dropUp ? { bottom: 'calc(100% + 4px)', top: 'auto' } : { top: 'calc(100% + 4px)' }),
             left: 0,
             minWidth: '100%',
             background: 'var(--surface-3)',

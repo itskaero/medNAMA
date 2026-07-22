@@ -54,6 +54,8 @@ CREATE TABLE users (
 CREATE TABLE mcqs (
     id SERIAL PRIMARY KEY,
     book_id INTEGER REFERENCES books(id),
+    quiz_set_id TEXT,
+    quiz_set_title TEXT,
     question_text TEXT NOT NULL,
     options JSONB NOT NULL,
     correct_option TEXT NOT NULL,
@@ -74,7 +76,10 @@ CREATE TABLE quiz_attempts (
     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at TIMESTAMPTZ,
     score INTEGER,
-    total_questions INTEGER
+    total_questions INTEGER,
+    timer_mode TEXT NOT NULL DEFAULT 'none',
+    timer_value INTEGER,
+    feedback_mode TEXT NOT NULL DEFAULT 'tutor'
 );
 
 CREATE TABLE attempt_answers (
@@ -83,6 +88,44 @@ CREATE TABLE attempt_answers (
     mcq_id INTEGER NOT NULL REFERENCES mcqs(id),
     selected_option TEXT NOT NULL,
     is_correct BOOLEAN NOT NULL
+);
+
+-- ============ Chat tables ============
+
+CREATE TABLE chat_conversations (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    title TEXT NOT NULL DEFAULT 'New Conversation',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE chat_messages (
+    id SERIAL PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES chat_conversations(id),
+    role TEXT NOT NULL,              -- 'user', 'ai', or 'error'
+    content TEXT,
+    answer_json TEXT,                -- Serialized AnswerResponse JSON
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ============ Bookmark tables ============
+
+CREATE TABLE mcq_bookmarks (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    mcq_id INTEGER NOT NULL REFERENCES mcqs(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE concept_bookmarks (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    content TEXT NOT NULL,
+    book_title TEXT,
+    page_number INTEGER,
+    source_context TEXT,             -- e.g. 'RAG chatbot' or 'MCQ Explanation'
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- ============ Indexes ============
@@ -101,6 +144,13 @@ CREATE INDEX ON mcqs (book_id);
 CREATE INDEX ON mcqs (topic);
 CREATE INDEX ON mcqs (main_category);
 CREATE INDEX ON mcqs (sub_category);
+CREATE INDEX ON mcqs (quiz_set_id);
 CREATE INDEX ON quiz_attempts (user_id);
 CREATE INDEX ON attempt_answers (quiz_attempt_id);
 CREATE INDEX ON attempt_answers (mcq_id);
+CREATE INDEX ON chat_conversations (user_id);
+CREATE INDEX ON chat_messages (conversation_id);
+CREATE INDEX ON mcq_bookmarks (user_id);
+CREATE INDEX ON mcq_bookmarks (mcq_id);
+CREATE INDEX ON concept_bookmarks (user_id);
+

@@ -17,6 +17,7 @@ import {
   Sun,
   Compass,
   Sunset,
+  Sparkles,
 } from "lucide-react";
 import { Book } from "@/types";
 import { BookItem } from "@/components";
@@ -85,7 +86,7 @@ export default function AppSidebar({
           setMobileMenuOpen(false);
         }}
       >
-        <div className="brand-mark" aria-hidden>
+        <div className="brand-logo" aria-hidden>
           <Stethoscope size={18} />
         </div>
         <span className="brand-name">
@@ -94,13 +95,49 @@ export default function AppSidebar({
       </div>
 
       {/* Profile */}
-      <div className="sidebar-profile">
-        <div className="avatar" aria-hidden>
-          {initials}
-        </div>
-        <div className="profile-meta">
-          <div className="profile-name">{username}</div>
-          <div className={`profile-badge ${role === "student" ? "role-student" : ""}`}>{role}</div>
+      <div className="sidebar-profile" style={{ justifyContent: "space-between" }}>
+        <div
+          className="user-handle-pill"
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "6px",
+            padding: "4px 10px 4px 6px",
+            background: "var(--surface-2)",
+            border: "1px solid var(--border-light)",
+            borderRadius: "var(--r-full)",
+            boxShadow: "0 2px 8px rgba(0, 0, 0, 0.15)",
+          }}
+        >
+          <span
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              width: "20px",
+              height: "20px",
+              borderRadius: "50%",
+              background: "var(--sky-dim)",
+              color: "var(--sky)",
+              fontSize: "0.72rem",
+              fontWeight: 700,
+              fontFamily: "var(--font-mono)",
+              boxShadow: "0 0 8px var(--sky-glow)",
+            }}
+          >
+            @
+          </span>
+          <span
+            style={{
+              fontSize: "0.78rem",
+              fontWeight: 600,
+              fontFamily: "var(--font-mono)",
+              color: "var(--text-primary)",
+              letterSpacing: "0.02em",
+            }}
+          >
+            {username}
+          </span>
         </div>
         <button className="btn-logout" onClick={handleLogout} aria-label="Sign out">
           <LogOut size={12} style={{ display: "inline", marginRight: 4 }} />
