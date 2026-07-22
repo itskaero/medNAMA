@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     max_upload_size_mb: int = 500
 
     # CORS
-    allowed_origins: str = "http://localhost:3000"
+    allowed_origins: str = "http://localhost:3000,https://med-nama.vercel.app"
 
     model_config = {
         "env_file": find_env_file(), 

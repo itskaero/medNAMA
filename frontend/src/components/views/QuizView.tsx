@@ -28,6 +28,7 @@ import {
   ArrowRight,
   ArrowLeft,
   AlertTriangle,
+  RotateCcw,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { AnswerResponse, Figure, Book } from "@/types";
@@ -114,6 +115,8 @@ interface StudioMessage {
   id: string;
   sender: "user" | "ai";
   content?: string;
+  isError?: boolean;
+  retryPrompt?: string;
   quizResult?: {
     quiz_set_id: string;
     quiz_set_title: string;
@@ -281,22 +284,24 @@ export default function QuizView({
     if (!getHeaders) return;
 
     const timeStr = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    const userMsgId = `user-${Date.now()}`;
 
-    setStudioMessages((prev) => [
-      ...prev,
-      {
-        id: userMsgId,
-        sender: "user",
-        content: queryPrompt,
-        timestamp: timeStr,
-      },
-    ]);
+    // Only append a new user message if this is not a direct retry of a prompt already in the thread
+    if (!customPrompt || !studioMessages.some((m) => m.content === customPrompt)) {
+      setStudioMessages((prev) => [
+        ...prev,
+        {
+          id: `user-${Date.now()}`,
+          sender: "user",
+          content: queryPrompt,
+          timestamp: timeStr,
+        },
+      ]);
+    }
 
     setPromptInput("");
     setIsGenerating(true);
 
-    const generationPromise = (async () => {
+    try {
       const res = await fetch(`${API}/api/chat/generate-ai-quiz`, {
         method: "POST",
         headers: {
@@ -310,48 +315,35 @@ export default function QuizView({
         }),
       });
 
+      const data = await res.json();
+
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || "Failed to generate quiz.");
+        throw new Error(data.detail || "Failed to generate quiz.");
       }
 
-      return await res.json();
-    })();
-
-    toast.promise(generationPromise, {
-      loading: "Generating board-style MCQs from textbook RAG context...",
-      success: (data) => {
-        fetchQuizHistory();
-        setStudioMessages((prev) => [
-          ...prev,
-          {
-            id: `ai-${Date.now()}`,
-            sender: "ai",
-            content: `I've generated **${data.quiz_set_title}** containing ${data.total_questions} board-style MCQs grounded directly in textbook RAG context!`,
-            quizResult: data,
-            timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-          },
-        ]);
-        return `Generated "${data.quiz_set_title}" (${data.total_questions} MCQs)!`;
-      },
-      error: (err) => {
-        setStudioMessages((prev) => [
-          ...prev,
-          {
-            id: `ai-err-${Date.now()}`,
-            sender: "ai",
-            content: `Sorry, I encountered an error while generating the quiz: ${err.message || "Failed to retrieve textbook context."}`,
-            timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-          },
-        ]);
-        return err.message || "An error occurred during quiz generation.";
-      },
-    });
-
-    try {
-      await generationPromise;
-    } catch {
-      // Handled by toast
+      fetchQuizHistory();
+      setStudioMessages((prev) => [
+        ...prev,
+        {
+          id: `ai-${Date.now()}`,
+          sender: "ai",
+          content: `I've generated **${data.quiz_set_title}** containing ${data.total_questions} board-style MCQs grounded directly in textbook RAG context!`,
+          quizResult: data,
+          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        },
+      ]);
+    } catch (err: any) {
+      setStudioMessages((prev) => [
+        ...prev,
+        {
+          id: `ai-err-${Date.now()}`,
+          sender: "ai",
+          isError: true,
+          retryPrompt: queryPrompt,
+          content: err.message || "Failed to retrieve textbook context or generate questions.",
+          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        },
+      ]);
     } finally {
       setIsGenerating(false);
     }
@@ -794,9 +786,33 @@ export default function QuizView({
                                       <Stethoscope size={12} className="ai-editorial-icon" />
                                       <span className="ai-editorial-name">Dr. MedNama</span>
                                     </div>
-                                    <div className="prose text-xs text-[var(--text-primary)] leading-relaxed">
-                                      <p>{msg.content}</p>
-                                    </div>
+                                    {msg.isError ? (
+                                      <div className="workspace-card quiz-error-card" style={{ marginTop: "6px", background: "rgba(239, 68, 68, 0.08)", border: "1px solid rgba(239, 68, 68, 0.25)", borderRadius: "var(--r-lg)", padding: "14px", display: "flex", flexDirection: "column", gap: "10px" }}>
+                                        <div style={{ display: "flex", alignItems: "flex-start", gap: "8px", color: "#ef4444", fontSize: "0.82rem" }}>
+                                          <AlertTriangle size={16} className="shrink-0" style={{ marginTop: "2px" }} />
+                                          <div>
+                                            <span style={{ fontWeight: 600, display: "block", marginBottom: "2px" }}>Quiz Generation Failed</span>
+                                            <span style={{ color: "var(--text-secondary)", fontSize: "0.8rem" }}>{msg.content}</span>
+                                          </div>
+                                        </div>
+                                        {msg.retryPrompt && (
+                                          <button
+                                            type="button"
+                                            onClick={() => handleGenerate(msg.retryPrompt)}
+                                            disabled={isGenerating}
+                                            className="btn-secondary py-1.5 px-3 text-xs font-bold rounded-lg flex items-center gap-1.5"
+                                            style={{ alignSelf: "flex-start", background: "var(--surface-3)", border: "1px solid var(--border-light)", color: "var(--text-primary)", cursor: isGenerating ? "not-allowed" : "pointer" }}
+                                          >
+                                            <RotateCcw size={13} className={isGenerating ? "animate-spin" : ""} />
+                                            <span>Retry Quiz Generation</span>
+                                          </button>
+                                        )}
+                                      </div>
+                                    ) : (
+                                      <div className="prose text-xs text-[var(--text-primary)] leading-relaxed">
+                                        <p>{msg.content}</p>
+                                      </div>
+                                    )}
 
                                     {msg.quizResult && (
                                       <div className="workspace-card quiz-card" style={{ marginTop: "12px", background: "var(--surface-2)", border: "1px solid var(--border-light)", borderRadius: "var(--r-lg)", padding: "14px", display: "flex", flexDirection: "column", gap: "8px" }}>
@@ -831,6 +847,20 @@ export default function QuizView({
                                   </div>
                                 </div>
                               )
+                            )}
+                            {isGenerating && (
+                              <div className="ai-message" style={{ margin: "8px 0" }}>
+                                <div className="ai-body" style={{ background: "var(--surface-2)", border: "1px solid var(--border-light)", borderRadius: "var(--r-lg)", padding: "14px" }}>
+                                  <div className="ai-editorial-header" style={{ marginBottom: "8px", display: "flex", alignItems: "center", gap: "6px" }}>
+                                    <Sparkles size={14} className="ai-editorial-icon text-[var(--sky)] animate-pulse" />
+                                    <span className="ai-editorial-name" style={{ fontWeight: 600, fontSize: "0.8rem", color: "var(--sky)" }}>Dr. MedNama (Generating Quiz...)</span>
+                                  </div>
+                                  <div style={{ display: "flex", alignItems: "center", gap: "10px", color: "var(--text-secondary)", fontSize: "0.82rem" }}>
+                                    <Loader2 size={16} className="animate-spin text-[var(--sky)] shrink-0" />
+                                    <span>Searching textbook RAG context & drafting board-style MCQs...</span>
+                                  </div>
+                                </div>
+                              </div>
                             )}
                           </div>
                         )}

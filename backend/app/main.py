@@ -37,11 +37,15 @@ from app.auth import (
 # Initialize FastAPI app
 app = FastAPI(title="medNAMA Core API", version="1.0.0")
 
-# Enable CORS with explicit trusted origins (required for allow_credentials=True with HttpOnly cookies)
+# Enable CORS with explicit trusted origins + regex for Vercel preview/production deployments
 origins = [origin.strip() for origin in settings.allowed_origins.split(",") if origin.strip()]
+if "https://med-nama.vercel.app" not in origins:
+    origins.append("https://med-nama.vercel.app")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -557,8 +561,14 @@ def generate_ai_quiz(
         f"TEXTBOOK CONTEXT:\n{context_str[:6000]}"
     )
 
+    if not settings.deepseek_api_key or settings.deepseek_api_key == "sk-dummy":
+        raise HTTPException(
+            status_code=400,
+            detail="DEEPSEEK_API_KEY environment variable is not configured on the server. Please set DEEPSEEK_API_KEY in Railway project settings."
+        )
+
     client = OpenAI(
-        api_key=settings.deepseek_api_key or "sk-dummy",
+        api_key=settings.deepseek_api_key,
         base_url=settings.deepseek_base_url
     )
 
