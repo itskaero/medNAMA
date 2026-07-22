@@ -37,6 +37,13 @@ def upgrade() -> None:
     op.execute("ALTER TABLE quiz_attempts ADD COLUMN IF NOT EXISTS timer_value INTEGER;")
     op.execute("ALTER TABLE quiz_attempts ADD COLUMN IF NOT EXISTS feedback_mode TEXT NOT NULL DEFAULT 'tutor';")
 
+    # Ensure mcqs columns exist
+    op.execute("ALTER TABLE mcqs ADD COLUMN IF NOT EXISTS quiz_set_id TEXT;")
+    op.execute("ALTER TABLE mcqs ADD COLUMN IF NOT EXISTS quiz_set_title TEXT;")
+    op.execute("ALTER TABLE mcqs ADD COLUMN IF NOT EXISTS explanation_markdown TEXT;")
+    op.execute("ALTER TABLE mcqs ADD COLUMN IF NOT EXISTS explanation_citations JSONB;")
+    op.execute("ALTER TABLE mcqs ADD COLUMN IF NOT EXISTS explanation_figures JSONB;")
+
     # Ensure all application tables exist
     op.execute("""
     CREATE TABLE IF NOT EXISTS chat_conversations (
