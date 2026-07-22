@@ -2,7 +2,7 @@
 
 import { FC, ReactNode, useState } from "react"
 import { PlusIcon, XIcon } from "lucide-react"
-import { motion } from "motion/react"
+import { motion } from "framer-motion"
 
 import { cn } from "@/lib/utils"
 
