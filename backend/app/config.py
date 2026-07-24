@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     # DeepSeek (Phase 4)
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com/v1"
-    deepseek_model: str = "deepseek-chat"
+    deepseek_model: str = "deepseek-v4-flash"
 
     # Gemini vision (Phase 2)
     gemini_api_key: str = ""
