@@ -111,6 +111,8 @@ The books were added for **trust, MCQ content and level setting** (undergraduate
 3. **Later:** SSE streaming for chat, and MCQ generation as a background job (`POST` returns `job_id`, then poll `GET /api/chat/ai-quizzes/jobs/{id}`), following the ingestion job pattern. After this, request length doesn't matter.
 
 ### Phase 3: Retrieval quality (fix the refusals)
+**Scope:** these fixes are general. They change how *every* question is searched, not only HPS. HPS is just the example that exposed the problem. Refusals affect several question styles: short terms ("paradoxical aciduria"), exam phrasing ("X of choice", "most common", "investigation of choice"), abbreviations (DKA, MOA), eponyms, US vs UK spelling, and long clinical scenarios. `run_diagnosis.py` runs a 16-question mixed suite (all 9 books, all these styles) and prints the refusal rate. Run it before and after each phase to prove the improvement across subjects.
+
 1. `calculate_confidence`: use the **cross-encoder score of the top re-ranked parent**, or a combined vector and keyword score. Pass borderline context through labelled "low confidence" instead of dropping it. Set the default threshold to about 0.45.
 2. Keyword search: remove question stop-phrases ("of choice", "drug of", "management of", "treatment of"), and **fall back to an OR query** when the AND query returns 0 rows.
 3. **US↔UK spelling expansion** (`-emia/-aemia`, `pedi/paedi`, `esoph/oesoph`, `hem/haem`, `edema/oedema`, `anemia/anaemia`).
