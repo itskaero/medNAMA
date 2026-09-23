@@ -101,7 +101,8 @@ The books were added for **trust, MCQ content and level setting** (undergraduate
 4. **Recover a result after a timeout:** if the quiz request still fails on the client, re-fetch `/api/chat/ai-quizzes` (by idempotency key) and show the set if it was saved. The user then never sees an error for work that succeeded.
 5. **DeepSeek client:** `OpenAI(timeout=60, max_retries=1)` in all three places, `max_tokens` set, and thinking/reasoning turned off or lowered for chat and MCQs if the model supports it.
 6. **Partial-success MCQs:** retry a failed batch once, keep the batches that succeeded, return `{created, failed_batches}`, and return 504 with a JSON `detail` for a provider timeout.
-7. **Quiz UI:** give it its own `AbortController` (about 180 s) and a clear timeout message, matching `useChat.ts`.
+7. **Backend logging:** app loggers (`app.generation`, `app.retrieval`) have no handler, so INFO lines such as "Retrieval confidence low" never appear in `docker logs`. Only uvicorn access lines (`POST /api/... 200`) and warnings/errors show. Fix: `logging.basicConfig(level=LOG_LEVEL, format=...)` in `main.py`, and log per request: query, confidence, gate result, top chunk IDs, DeepSeek latency and errors. `backend/scripts/diagnose_query.py` is a read-only diagnostic until then.
+8. **Quiz UI:** give it its own `AbortController` (about 180 s) and a clear timeout message, matching `useChat.ts`.
 
 ### Phase 2: Make it fast
 1. Run the MCQ batches **in parallel** (`ThreadPoolExecutor` or `AsyncOpenAI` + `gather`), then merge and deduplicate.
