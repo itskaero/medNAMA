@@ -47,6 +47,7 @@ One plan covering the problems reported so far, why each happens, and the fixes 
 | A6 | Earlier refusals are replayed in `history`, which pushes the model toward refusing again. | `main.py::chat_query_endpoint` |
 | A7 | Errors (API failure, bad JSON, wrong model name) look like "not covered". | `generation.py` `except` |
 | A8 | The re-ranker is general web-search (`ms-marco-MiniLM`). The synonym map has only 10 entries (no HPS/IHPS, DKA, NS/RL…). | `retrieval.py` |
+| A10 | **Chat and MCQ generation use different rules.** MCQ generation has no confidence check and no "refuse" rule, so it always receives the passages and the model can add its own knowledge. Chat drops the passages when the vector score is below 0.55 and then must refuse. The same Bailey & Love page 280 content (HPS → paradoxical aciduria) appears in an MCQ explanation but is refused in chat. MCQ explanations and sources are also not validated, so book facts and model knowledge mix without a label. | `main.py::generate_ai_quiz` vs `generation.py::generate_answer` |
 | A9 | Sources aren't returned on a refusal, so the user can't see what nearly matched. | `generation.py` |
 
 ### B. "Failed to fetch" / 500 errors
