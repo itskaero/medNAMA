@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: medrag
       POSTGRES_DB: medrag
     ports:
-      - "5433:5432"
+      - "${DB_PORT:-5433}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
 

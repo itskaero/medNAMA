@@ -1,10 +1,13 @@
 "use client";
 
 import React from "react";
-import { BookMarked, GraduationCap, Bookmark, Check } from "lucide-react";
+import { BookMarked, GraduationCap, Bookmark, Check, Download } from "lucide-react";
 import { AnswerResponse, Figure } from "@/types";
 import BasicDropdown from "@/components/ui/basic-dropdown";
 import ExplanationPanel from "@/components/ExplanationPanel";
+import { API } from "@/lib/constants";
+import { downloadAuthenticatedCSV } from "@/lib/downloadCSV";
+import { toast } from "sonner";
 
 interface MCQBankViewProps {
   stats: any;
@@ -101,6 +104,19 @@ export default function MCQBankView({
             value={mcqSearchText}
             onChange={(e) => setMcqSearchText(e.target.value)}
           />
+          <button
+            className="btn-workspace"
+            style={{ display: "inline-flex", alignItems: "center", gap: "6px", padding: "8px 12px", fontSize: "0.78rem", height: "38px" }}
+            onClick={async () => {
+              const ok = await downloadAuthenticatedCSV(`${API}/api/export/mcqs`, "mednama_mcq_bank.csv", token);
+              if (ok) toast.success("MCQ bank exported to CSV.");
+              else toast.error("Failed to export MCQ bank.");
+            }}
+            title="Download the full shared MCQ bank as a CSV"
+          >
+            <Download size={13} />
+            Export Bank
+          </button>
         </div>
       </div>
 

@@ -3,6 +3,7 @@ import { Stethoscope, AlertCircle, Check, Copy, Bookmark } from "lucide-react";
 import { Message, Figure } from "../types";
 import { CitationsDrawer } from "./CitationsDrawer";
 import { FiguresDrawer } from "./FiguresDrawer";
+import { SourcesPanel } from "./SourcesPanel";
 import { parseMarkdown } from "../utils/markdown";
 
 export function AIMessage({
@@ -80,6 +81,9 @@ export function AIMessage({
               token={token}
               onFigureClick={onFigureClick}
             />
+
+            {/* F1 — hybrid sources panel (reranked candidates before merge) */}
+            <SourcesPanel sources={msg.answer.sources || []} token={token} />
 
             <div className="answer-footer" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%", marginTop: "var(--sp-4)" }}>
               <div style={{ display: "flex", gap: "var(--sp-2)", flexWrap: "wrap" }}>

@@ -371,6 +371,51 @@ export function useQuiz({
     };
   }, [activeView, quizStep, quizCurrentIdx, quizMCQs, quizSelectedAnswers, quizIsSubmitting, explanationMCQId]);
 
+  // Launch a practice session built from previously-missed questions
+  const handleStartDrill = async () => {
+    setQuizIsLoading(true);
+    try {
+      const res = await fetch(`${API}/api/quizzes/start`, {
+        method: "POST",
+        headers: {
+          ...getHeaders(),
+          "Content-Type": "application/json",
+        },
+        credentials: "include",
+        body: JSON.stringify({
+          drill_wrong: true,
+          num_questions: Math.min(quizConfigNumQuestions || 10, 50),
+          exclude_mastered: false,
+          timer_mode: quizConfigTimerMode,
+          timer_value: quizConfigTimerValue,
+          feedback_mode: quizConfigFeedbackMode,
+        }),
+      });
+      if (!res.ok) {
+        const d = await res.json();
+        throw new Error(d.detail || "No missed questions found.");
+      }
+      const data = await res.json();
+      setQuizMCQs(data.mcqs);
+      setQuizAttemptId(data.quiz_attempt_id);
+      setQuizCurrentIdx(0);
+      setQuizSelectedAnswers({});
+      setQuizStep("taker");
+      setQuizSecondsElapsed(0);
+      if (data.timer_mode === "session") setQuizTimerCountdown(data.timer_value * 60);
+      else if (data.timer_mode === "per_question") setQuizTimerCountdown(data.timer_value);
+      else setQuizTimerCountdown(0);
+      setQuizTimerActive(true);
+      toast.success("Missed-Question Drill Started", {
+        description: `${data.mcqs.length} previously-missed MCQs loaded.`,
+      });
+    } catch (err: any) {
+      toast.error(err.message || "Failed to start drill session.", { duration: Infinity });
+    } finally {
+      setQuizIsLoading(false);
+    }
+  };
+
   // Launch custom AI-generated quiz set
   const startAiCustomQuiz = async (quizSetId: string) => {
     setQuizIsLoading(true);
@@ -466,6 +511,7 @@ export function useQuiz({
     explanationError,
     // handlers
     handleStartQuiz,
+    handleStartDrill,
     startAiCustomQuiz,
     handleSubmitQuiz,
     handleSelectOption,

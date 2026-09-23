@@ -65,6 +65,7 @@ CREATE TABLE mcqs (
     explanation_markdown TEXT,
     explanation_citations JSONB,
     explanation_figures JSONB,
+    difficulty INTEGER CHECK (difficulty IS NULL OR difficulty BETWEEN 1 AND 5),  -- AI-generated sets only
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'generating', 'ready', 'failed')),
     error_message TEXT

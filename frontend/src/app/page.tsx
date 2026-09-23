@@ -5,6 +5,7 @@ import { Stethoscope, Menu } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
 import { Figure } from "../types";
+import { API } from "@/lib/constants";
 
 // ─── Hooks ──────────────────────────────────────────────────────────────────
 import { useTheme } from "@/hooks/useTheme";
@@ -17,6 +18,7 @@ import { useChat } from "@/hooks/useChat";
 import { useBookmarks } from "@/hooks/useBookmarks";
 import { useMCQBank } from "@/hooks/useMCQBank";
 import { useQuiz } from "@/hooks/useQuiz";
+import { useStudy } from "@/hooks/useStudy";
 
 // ─── Layout Components ───────────────────────────────────────────────────────
 import AuthCard from "@/components/layout/AuthCard";
@@ -31,12 +33,13 @@ import BookmarksView from "@/components/views/BookmarksView";
 import StatsView from "@/components/views/StatsView";
 import QuizView from "@/components/views/QuizView";
 import ChatView from "@/components/views/ChatView";
+import StudyView from "@/components/views/StudyView";
 
 // ─── Main Component ──────────────────────────────────────────────────────────
 export default function Home() {
   // ── Shared navigation state ────────────────────────────────────────────────
   const [activeView, setActiveView] = useState<
-    "dashboard" | "chat" | "quiz" | "mcq-bank" | "bookmarks" | "stats"
+    "dashboard" | "chat" | "quiz" | "mcq-bank" | "bookmarks" | "stats" | "study"
   >("dashboard");
   const [selectedTopic, setSelectedTopic] = useState<any>(null);
   const [isChatMinimized, setIsChatMinimized] = useState(false);
@@ -44,6 +47,12 @@ export default function Home() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [openAccordionCategory, setOpenAccordionCategory] = useState<string | null>(null);
   const [lightboxFig, setLightboxFig] = useState<Figure | null>(null);
+  // F2 — chat source scope
+  const [chatScope, setChatScope] = useState<{ book_id: number | null; chapter: string | null }>({
+    book_id: null,
+    chapter: null,
+  });
+  const [chatChapters, setChatChapters] = useState<string[]>([]);
 
   // ── Refs ───────────────────────────────────────────────────────────────────
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -126,7 +135,25 @@ export default function Home() {
     inputRef,
     messages,
     setMessages,
+    scope: chatScope,
   });
+
+  // F2 — fetch distinct chapter headings when the user scopes chat to a book
+  const fetchChatChapters = useCallback(
+    (bookId: number) => {
+      const savedToken = token || localStorage.getItem("token");
+      if (!savedToken) return;
+      setChatChapters([]);
+      fetch(`${API}/api/books/${bookId}/chapters`, {
+        headers: { Authorization: `Bearer ${savedToken}` },
+        credentials: "include",
+      })
+        .then((res) => (res.ok ? res.json() : Promise.reject(new Error("Failed to load chapters"))))
+        .then((data) => setChatChapters(data.chapters || []))
+        .catch((err) => console.error(err));
+    },
+    [token]
+  );
 
   const {
     bookmarkedMcqs,
@@ -168,6 +195,8 @@ export default function Home() {
     stats,
     fetchStats,
   });
+
+  const study = useStudy({ token, getHeaders });
 
   // ── Derived values ─────────────────────────────────────────────────────────
   const isAdmin = role === "admin";
@@ -369,6 +398,27 @@ export default function Home() {
       );
     }
 
+    if (activeView === "study") {
+      return (
+        <StudyView
+          token={token}
+          notes={study.notes}
+          flashcards={study.flashcards}
+          isLoadingNotes={study.isLoadingNotes}
+          isLoadingFlashcards={study.isLoadingFlashcards}
+          fetchNotes={study.fetchNotes}
+          fetchFlashcards={study.fetchFlashcards}
+          createNote={study.createNote}
+          updateNote={study.updateNote}
+          deleteNote={study.deleteNote}
+          createFlashcard={study.createFlashcard}
+          updateFlashcard={study.updateFlashcard}
+          deleteFlashcard={study.deleteFlashcard}
+          reviewFlashcard={study.reviewFlashcard}
+        />
+      );
+    }
+
     // Default: Chat view
     return (
       <ChatView
@@ -398,6 +448,11 @@ export default function Home() {
         inputRef={inputRef}
         onFigureClick={setLightboxFig}
         handleCreateConceptBookmark={handleCreateConceptBookmark}
+        books={books}
+        scope={chatScope}
+        setScope={setChatScope}
+        chapters={chatChapters}
+        fetchChapters={fetchChatChapters}
       />
     );
   };

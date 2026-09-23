@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Env / secrets
+.env
+.env.local
+
+# Ignored files (pdfs tracked separately)
+*.dump
+
+# Large / local-only artifacts (never push these)
+ingest_all.cmd
+toDo/
+pdfs/
+pdfs.zip
+docker-compose.local.yaml
+
+# Ingestion artifacts
+logs/
+*.log
+.page_counts.json
+
+# Node
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# OS
+Thumbs.db
+.DS_Store

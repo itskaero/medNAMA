@@ -11,10 +11,18 @@ import {
   Pin,
   Trash2,
   ChevronDown,
+  X,
+  BookOpen,
 } from "lucide-react";
-import { Message, Figure } from "@/types";
+import { Message, Figure, Book } from "@/types";
 import { AIMessage } from "@/components";
+import BasicDropdown from "@/components/ui/basic-dropdown";
 import { groupConversations } from "@/utils/quizHelpers";
+
+export interface ChatScope {
+  book_id: number | null;
+  chapter: string | null;
+}
 
 const SUGGESTIONS = [
   { icon: <span>🔬</span>, text: "What did Louis Pasteur say about microbes?" },
@@ -55,6 +63,12 @@ interface ChatViewProps {
     page?: number | null,
     context?: string | null
   ) => void;
+  // F2 — scoped retrieval
+  books?: Book[];
+  scope?: ChatScope;
+  setScope?: (s: ChatScope) => void;
+  chapters?: string[];
+  fetchChapters?: (bookId: number) => void;
 }
 
 export default function ChatView({
@@ -84,6 +98,11 @@ export default function ChatView({
   inputRef,
   onFigureClick,
   handleCreateConceptBookmark,
+  books = [],
+  scope,
+  setScope,
+  chapters = [],
+  fetchChapters,
 }: ChatViewProps) {
   // Scroll to bottom whenever messages change
   useEffect(() => {
@@ -355,6 +374,91 @@ export default function ChatView({
 
         {/* Input bar */}
         <div className="input-area">
+          {/* F2 — source scope (book + chapter scoping) */}
+          <div
+            style={{
+              display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap",
+              marginBottom: "8px", padding: "0 4px",
+            }}
+            aria-label="Chat source scope"
+          >
+            <span
+              style={{
+                fontSize: "0.62rem", fontWeight: 700, color: "var(--text-muted)",
+                textTransform: "uppercase", letterSpacing: "0.06em",
+                display: "inline-flex", alignItems: "center", gap: "4px",
+              }}
+            >
+              <BookOpen size={11} />
+              Source scope
+            </span>
+
+            {setScope && fetchChapters ? (
+              <>
+                <div style={{ width: "200px" }}>
+                  <BasicDropdown
+                    items={[
+                      { value: "all", label: "All Textbooks" },
+                      ...(books?.filter((b) => b.status === "ready").map((b) => ({
+                        value: b.id.toString(),
+                        label: b.title,
+                      })) || []),
+                    ]}
+                    value={scope?.book_id ? scope.book_id.toString() : "all"}
+                    onChange={(val) => {
+                      setScope({ book_id: val === "all" ? null : Number(val), chapter: null });
+                      if (val !== "all") fetchChapters(Number(val));
+                    }}
+                    ariaLabel="Scope retrieval to a textbook"
+                  />
+                </div>
+
+                {scope?.book_id ? (
+                  <div style={{ width: "220px", maxWidth: "40vw" }}>
+                    <BasicDropdown
+                      items={[
+                        { value: "all", label: "All Chapters" },
+                        ...chapters.map((c) => ({ value: c, label: c })),
+                      ]}
+                      value={scope.chapter ?? "all"}
+                      onChange={(val) =>
+                        setScope({ ...scope, chapter: val === "all" ? null : val })
+                      }
+                      ariaLabel="Scope retrieval to a chapter"
+                    />
+                  </div>
+                ) : null}
+              </>
+            ) : null}
+
+            {scope?.book_id ? (
+              <>
+                <span
+                  className="model-chip-pill"
+                  style={{ fontSize: "0.7rem", maxWidth: "260px", overflow: "hidden", textOverflow: "ellipsis" }}
+                  title={
+                    (books?.find((b) => b.id === scope.book_id)?.title || `Book ${scope.book_id}`) +
+                    (scope.chapter ? ` · ${scope.chapter}` : "")
+                  }
+                >
+                  <span className="model-chip-dot" />
+                  {books?.find((b) => b.id === scope.book_id)?.title || `Book ${scope.book_id}`}
+                  {scope.chapter ? ` · ${scope.chapter}` : ""}
+                </span>
+                <button
+                  className="btn-workspace"
+                  onClick={() => setScope?.({ book_id: null, chapter: null })}
+                  title="Clear source scope — search all textbooks"
+                  aria-label="Clear source scope"
+                  style={{ display: "inline-flex", alignItems: "center", gap: "4px", padding: "4px 10px", fontSize: "0.7rem" }}
+                >
+                  <X size={10} />
+                  Clear
+                </button>
+              </>
+            ) : null}
+          </div>
+
           <div className="composer-card">
             <textarea
               ref={inputRef}

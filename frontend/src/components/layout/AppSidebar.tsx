@@ -18,6 +18,7 @@ import {
   Compass,
   Sunset,
   Sparkles,
+  NotebookPen,
 } from "lucide-react";
 import { Book } from "@/types";
 import { BookItem } from "@/components";
@@ -194,6 +195,16 @@ export default function AppSidebar({
         >
           <Bookmark size={14} />
           Bookmarks
+        </button>
+        <button
+          className={`btn-workspace-nav ${activeView === "study" ? "active" : ""}`}
+          onClick={() => {
+            setActiveView("study");
+            setMobileMenuOpen(false);
+          }}
+        >
+          <NotebookPen size={14} />
+          Study Corner
         </button>
         <button
           className={`btn-workspace-nav ${activeView === "quiz" ? "active" : ""}`}

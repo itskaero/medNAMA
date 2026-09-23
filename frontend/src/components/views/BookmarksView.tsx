@@ -1,10 +1,13 @@
 "use client";
 
 import React from "react";
-import { BookOpen, Bookmark, GraduationCap, Trash2, Check } from "lucide-react";
+import { BookOpen, Bookmark, GraduationCap, Trash2, Check, Download } from "lucide-react";
 import { AnswerResponse, Figure } from "@/types";
 import { parseMarkdown } from "@/utils/markdown";
 import ExplanationPanel from "@/components/ExplanationPanel";
+import { API } from "@/lib/constants";
+import { downloadAuthenticatedCSV } from "@/lib/downloadCSV";
+import { toast } from "sonner";
 
 interface BookmarksViewProps {
   bookmarkedMcqs: any[];
@@ -49,6 +52,19 @@ export default function BookmarksView({
           Saved Study Materials
         </div>
         <h1 className="dashboard-title">Bookmarks</h1>
+        <button
+          className="btn-workspace"
+          style={{ marginTop: "var(--sp-2)", display: "inline-flex", alignItems: "center", gap: "6px", padding: "6px 12px", fontSize: "0.75rem" }}
+          onClick={async () => {
+            const ok = await downloadAuthenticatedCSV(`${API}/api/export/bookmarks`, "mednama_bookmarks.csv", token);
+            if (ok) toast.success("Bookmarks exported to CSV.");
+            else toast.error("Failed to export bookmarks.");
+          }}
+          title="Download your saved MCQs and concept extracts as a CSV"
+        >
+          <Download size={12} />
+          Export
+        </button>
       </div>
 
       <div

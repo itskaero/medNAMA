@@ -21,6 +21,7 @@ NOT_COVERED_RESPONSE = {
     "answer_markdown": "I am sorry, but the answer to your question is not covered in the provided textbooks.",
     "citations": [],
     "figures": [],
+    "sources": [],
 }
 
 
@@ -128,21 +129,24 @@ def generate_answer(
     session: Session, 
     query: str, 
     confidence_threshold: float = 0.55, 
-    history: list[dict[str, str]] | None = None
+    history: list[dict[str, str]] | None = None,
+    book_id: int | None = None,
+    chapter: str | None = None
 ) -> dict[str, Any]:
     """Retrieves relevant textbook chunks and generates a grounded response using DeepSeek.
 
     Validates citations and figures server-side to guarantee zero hallucinations.
+    Optionally scopes retrieval to a single book and/or chapter.
     """
     # 1. Check Retrieval Confidence (Proposal 2)
     query_emb = retrieval_service._embed_query(query)
-    vector_results = retrieval_service.vector_search(session, query_emb, limit=10)
-    keyword_results = retrieval_service.keyword_search(session, query, limit=10)
+    vector_results = retrieval_service.vector_search(session, query_emb, limit=10, book_id=book_id, chapter=chapter)
+    keyword_results = retrieval_service.keyword_search(session, query, limit=10, book_id=book_id, chapter=chapter)
 
     confidence = retrieval_service.calculate_confidence(vector_results, keyword_results)
     
     # 2. Hybrid Retrieval
-    chunks = retrieval_service.hybrid_search(session, query, limit=5)
+    chunks = retrieval_service.hybrid_search(session, query, limit=5, book_id=book_id, chapter=chapter)
 
     has_medical_context = (confidence >= confidence_threshold) and bool(chunks)
     if not has_medical_context:
@@ -257,6 +261,10 @@ def generate_answer(
 
         # 7. Validate Citations & Figures
         validated_json = validate_generation(response_json, chunks, all_figures)
+
+        # 8. Attach the pre-merge reranked candidates for the "matched sources" panel
+        sources = retrieval_service.candidate_search(session, query, limit=8, book_id=book_id, chapter=chapter)
+        validated_json["sources"] = sources
         return validated_json
 
     except Exception as e:

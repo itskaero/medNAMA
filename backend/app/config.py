@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     # Ingestion
     max_upload_size_mb: int = 500
 
+    # AI quiz generation
+    ai_mcq_difficulty: int | None = None  # default difficulty (1-5) when a request doesn't specify one
+
     # CORS
     allowed_origins: str = "http://localhost:3000,https://med-nama.vercel.app"
 

@@ -22,10 +22,23 @@ export interface Figure {
   page_number?: number;
 }
 
+/** A reranked candidate shown in the collapsible "All matched sources" panel. */
+export interface RAGSource {
+  chunk_id: number;
+  book_id: number | null;
+  book_title: string;
+  chapter: string | null;
+  page_number: number | null;
+  snippet: string;
+  rank: number;
+  relevance_score: number;
+}
+
 export interface AnswerResponse {
   answer_markdown: string;
   citations: Citation[];
   figures: Figure[];
+  sources?: RAGSource[];
 }
 
 export interface Message {
@@ -38,4 +51,39 @@ export interface Message {
   timestamp?: string;
 }
 
-export type ActiveView = "chat" | "dashboard" | "mcq-bank" | "bookmarks" | "quiz" | "stats" | "reader";
+export interface Note {
+  id: number;
+  title: string;
+  content: string;
+  book_title: string | null;
+  page_number: number | null;
+  source_context: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface Flashcard {
+  id: number;
+  front: string;
+  back: string;
+  topic: string | null;
+  book_title: string | null;
+  page_number: number | null;
+  box: number;
+  review_count: number;
+  last_reviewed: string | null;
+  next_due: string | null;
+  created_at: string | null;
+}
+
+export type StudyTab = "notes" | "flashcards";
+
+export type ActiveView =
+  | "chat"
+  | "dashboard"
+  | "mcq-bank"
+  | "bookmarks"
+  | "quiz"
+  | "stats"
+  | "reader"
+  | "study";

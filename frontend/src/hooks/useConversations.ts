@@ -59,6 +59,7 @@ export function useConversations({ token }: UseConversationsParams) {
                   answer_markdown: m.content || "",
                   citations: m.answer?.citations || [],
                   figures: m.answer?.figures || [],
+                  sources: m.answer?.sources || [],
                 },
               };
             } else {

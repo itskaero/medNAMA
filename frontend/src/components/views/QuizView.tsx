@@ -33,6 +33,7 @@ import {
 import { motion, AnimatePresence } from "framer-motion";
 import { AnswerResponse, Figure, Book } from "@/types";
 import { API } from "@/lib/constants";
+import { proxySafeFetch } from "@/lib/proxyFetch";
 import { toast } from "sonner";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Switch } from "@/components/ui/switch";
@@ -90,6 +91,7 @@ interface QuizViewProps {
   handleStartQuiz: () => void;
   handleSubmitQuiz: () => void;
   handleSelectOption: (key: string) => void;
+  handleStartDrill?: () => void;
   fetchExplanation: (mcqId: number) => void;
   formatTime: (totalSec: number) => string;
   // other
@@ -109,6 +111,7 @@ interface AiQuizSetSummary {
   quiz_set_title: string;
   question_count: number;
   topic: string;
+  difficulty?: number | null;
 }
 
 interface StudioMessage {
@@ -121,11 +124,13 @@ interface StudioMessage {
     quiz_set_id: string;
     quiz_set_title: string;
     total_questions: number;
+    difficulty?: number | null;
     mcqs: Array<{
       id: number;
       question_text: string;
       options: Record<string, string>;
       correct_option: string;
+      difficulty?: number | null;
       explanation_markdown?: string;
     }>;
   };
@@ -174,6 +179,7 @@ export default function QuizView({
   handleStartQuiz,
   handleSubmitQuiz,
   handleSelectOption,
+  handleStartDrill,
   fetchExplanation,
   formatTime,
   stats,
@@ -191,6 +197,8 @@ export default function QuizView({
   const [promptInput, setPromptInput] = React.useState("");
   const [selectedBookId, setSelectedBookId] = React.useState<number | "all">("all");
   const [isGenerating, setIsGenerating] = React.useState(false);
+  const [aiDifficulty, setAiDifficulty] = React.useState(3); // 1-5, sent to the AI quiz generator
+  const [aiCount, setAiCount] = React.useState(5); // F3 — multiples of 5 only: 5/10/15/20
   const [quizHistory, setQuizHistory] = React.useState<AiQuizSetSummary[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = React.useState(false);
   const [historySearch, setHistorySearch] = React.useState("");
@@ -302,7 +310,7 @@ export default function QuizView({
     setIsGenerating(true);
 
     try {
-      const res = await fetch(`${API}/api/chat/generate-ai-quiz`, {
+      const res = await proxySafeFetch(`${API}/api/chat/generate-ai-quiz`, {
         method: "POST",
         headers: {
           ...getHeaders(),
@@ -312,22 +320,28 @@ export default function QuizView({
         body: JSON.stringify({
           prompt: queryPrompt,
           book_id: selectedBookId === "all" ? null : selectedBookId,
+          difficulty: aiDifficulty,
+          count: aiCount,
         }),
       });
 
-      const data = await res.json();
+      const data = (await res.json().catch(() => null)) as any;
 
       if (!res.ok) {
-        throw new Error(data.detail || "Failed to generate quiz.");
+        throw new Error((data && data.detail) || `Failed to generate quiz (HTTP ${res.status}).`);
       }
 
       fetchQuizHistory();
+      const dupNote =
+        data && typeof data.duplicates_skipped === "number" && data.duplicates_skipped > 0
+          ? `\n\n_${data.duplicates_skipped} near-duplicate${data.duplicates_skipped === 1 ? "" : "s"} were skipped to keep this set fresh._`
+          : "";
       setStudioMessages((prev) => [
         ...prev,
         {
           id: `ai-${Date.now()}`,
           sender: "ai",
-          content: `I've generated **${data.quiz_set_title}** containing ${data.total_questions} board-style MCQs grounded directly in textbook RAG context!`,
+          content: `I've generated **${data.quiz_set_title}** containing ${data.total_questions} board-style MCQs grounded directly in textbook RAG context!${dupNote}`,
           quizResult: data,
           timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
         },
@@ -644,6 +658,25 @@ export default function QuizView({
               </button>
             </div>
 
+            {/* F4 — drill previously-missed questions */}
+            <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: "14px" }}>
+              <button
+                type="button"
+                className="btn-workspace"
+                onClick={handleStartDrill}
+                disabled={quizIsLoading}
+                title="Practice only the questions you've answered incorrectly before"
+                style={{ display: "inline-flex", alignItems: "center", gap: "6px", padding: "6px 14px", fontSize: "0.76rem" }}
+              >
+                {quizIsLoading ? (
+                  <Loader2 size={12} style={{ animation: "spin 1s linear infinite" }} />
+                ) : (
+                  <RotateCcw size={12} />
+                )}
+                Drill Missed Questions
+              </button>
+            </div>
+
             {/* Mode Content Container with Fixed Min-Height & Transition Animations */}
             <div style={{ minHeight: "440px", display: "flex", flexDirection: "column", position: "relative" }}>
               <AnimatePresence mode="wait">
@@ -821,6 +854,11 @@ export default function QuizView({
                                             <div className="workspace-badge" style={{ display: "inline-flex", background: "var(--sky-dim)", color: "var(--sky)", fontSize: "0.65rem", padding: "1px 6px" }}>
                                               {msg.quizResult.total_questions} MCQs Ready
                                             </div>
+                                            {!!msg.quizResult.difficulty && (
+                                              <div className="workspace-badge" style={{ display: "inline-flex", background: "var(--surface-3)", color: "var(--text-secondary)", fontSize: "0.65rem", padding: "1px 6px", marginLeft: "6px" }}>
+                                                Difficulty {msg.quizResult.difficulty}/5
+                                              </div>
+                                            )}
                                             <h4 style={{ fontSize: "0.9rem", fontWeight: 700, marginTop: "4px" }}>
                                               {msg.quizResult.quiz_set_title}
                                             </h4>
@@ -884,20 +922,78 @@ export default function QuizView({
                         />
 
                         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "6px" }}>
-                          <div style={{ width: "200px" }}>
-                            <BasicDropdown
-                              items={[
-                                { value: "all", label: "All Books" },
-                                ...(books?.filter((b) => b.status === "ready").map((b) => ({
-                                  value: b.id.toString(),
-                                  label: b.title,
-                                })) || []),
-                              ]}
-                              value={selectedBookId.toString()}
-                              onChange={(val) => setSelectedBookId(val === "all" ? "all" : Number(val))}
-                              ariaLabel="Select book for mock quiz"
-                              dropUp={true}
-                            />
+                          <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
+                            <div style={{ width: "180px" }}>
+                              <BasicDropdown
+                                items={[
+                                  { value: "all", label: "All Books" },
+                                  ...(books?.filter((b) => b.status === "ready").map((b) => ({
+                                    value: b.id.toString(),
+                                    label: b.title,
+                                  })) || []),
+                                ]}
+                                value={selectedBookId.toString()}
+                                onChange={(val) => setSelectedBookId(val === "all" ? "all" : Number(val))}
+                                ariaLabel="Select book for mock quiz"
+                                dropUp={true}
+                              />
+                            </div>
+                            <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                              <span style={{ fontSize: "0.66rem", fontWeight: 700, color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.05em", marginRight: "2px" }}>
+                                Difficulty
+                              </span>
+                              {[1, 2, 3, 4, 5].map((d) => (
+                                <button
+                                  key={d}
+                                  type="button"
+                                  title={`Difficulty ${d}/5`}
+                                  onClick={() => setAiDifficulty(d)}
+                                  style={{
+                                    width: "24px",
+                                    height: "24px",
+                                    borderRadius: "6px",
+                                    border: "1px solid",
+                                    borderColor: aiDifficulty === d ? "var(--sky)" : "var(--border-light)",
+                                    background: aiDifficulty === d ? "rgba(48,197,255,0.12)" : "var(--surface-3)",
+                                    color: aiDifficulty === d ? "var(--sky)" : "var(--text-secondary)",
+                                    cursor: "pointer",
+                                    fontWeight: 700,
+                                    fontSize: "0.72rem",
+                                    transition: "all var(--dur-fast)",
+                                  }}
+                                >
+                                  {d}
+                                </button>
+                              ))}
+                            </div>
+                            <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                              <span style={{ fontSize: "0.66rem", fontWeight: 700, color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.05em", marginRight: "2px" }}>
+                                Count
+                              </span>
+                              {[5, 10, 15, 20].map((num) => (
+                                <button
+                                  key={num}
+                                  type="button"
+                                  title={`${num} questions`}
+                                  onClick={() => setAiCount(num)}
+                                  style={{
+                                    width: "28px",
+                                    height: "24px",
+                                    borderRadius: "6px",
+                                    border: "1px solid",
+                                    borderColor: aiCount === num ? "var(--sky)" : "var(--border-light)",
+                                    background: aiCount === num ? "rgba(48,197,255,0.12)" : "var(--surface-3)",
+                                    color: aiCount === num ? "var(--sky)" : "var(--text-secondary)",
+                                    cursor: "pointer",
+                                    fontWeight: 700,
+                                    fontSize: "0.7rem",
+                                    transition: "all var(--dur-fast)",
+                                  }}
+                                >
+                                  {num}
+                                </button>
+                              ))}
+                            </div>
                           </div>
                           <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                             <span className="keyboard-send-hint" style={{ fontSize: "0.68rem" }}>⏎ to generate</span>
@@ -949,7 +1045,10 @@ export default function QuizView({
                             >
                               <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
                                 <span style={{ fontWeight: 600, fontSize: "0.84rem", color: "var(--text-primary)" }}>{qSet.quiz_set_title}</span>
-                                <span style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>{qSet.question_count} MCQs · {qSet.topic || "Custom Quiz"}</span>
+                                <span style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>
+                                  {qSet.question_count} MCQs · {qSet.topic || "Custom Quiz"}
+                                  {qSet.difficulty ? ` · Difficulty ${qSet.difficulty}/5` : ""}
+                                </span>
                               </div>
                               <div style={{ display: "flex", gap: "6px" }}>
                                 <button

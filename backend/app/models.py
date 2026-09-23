@@ -24,8 +24,12 @@ class Book(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
-    chunks: Mapped[list["Chunk"]] = relationship(back_populates="book", cascade="all, delete-orphan")
-    figures: Mapped[list["Figure"]] = relationship(back_populates="book", cascade="all, delete-orphan")
+    chunks: Mapped[list["Chunk"]] = relationship(
+        back_populates="book", cascade="all, delete-orphan", passive_deletes=True
+    )
+    figures: Mapped[list["Figure"]] = relationship(
+        back_populates="book", cascade="all, delete-orphan", passive_deletes=True
+    )
 
     __table_args__ = (
         CheckConstraint("status IN ('pending', 'processing', 'ready', 'failed')"),
@@ -97,12 +101,14 @@ class MCQ(Base):
     explanation_citations: Mapped[dict | None] = mapped_column(JSONB, default=None)
     explanation_figures: Mapped[dict | None] = mapped_column(JSONB, default=None)
     status: Mapped[str] = mapped_column(Text, server_default="pending")
+    difficulty: Mapped[int | None] = mapped_column(default=None)  # 1 (easiest) - 5 (hardest), None = unspecified
     error_message: Mapped[str | None] = mapped_column(Text, default=None)
 
     book: Mapped["Book | None"] = relationship()
 
     __table_args__ = (
         CheckConstraint("status IN ('pending', 'generating', 'ready', 'failed')"),
+        CheckConstraint("difficulty IS NULL OR difficulty BETWEEN 1 AND 5"),
     )
 
 
@@ -183,6 +189,41 @@ class ConceptBookmark(Base):
     book_title: Mapped[str | None] = mapped_column(Text, nullable=True)
     page_number: Mapped[int | None] = mapped_column(nullable=True)
     source_context: Mapped[str | None] = mapped_column(Text, nullable=True)  # e.g., "RAG chatbot" or "MCQ Explanation"
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    user: Mapped["User"] = relationship()
+
+
+class Note(Base):
+    __tablename__ = "notes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    title: Mapped[str] = mapped_column(Text, default="Untitled Note")
+    content: Mapped[str] = mapped_column(Text)
+    book_title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    page_number: Mapped[int | None] = mapped_column(nullable=True)
+    source_context: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    user: Mapped["User"] = relationship()
+
+
+class Flashcard(Base):
+    __tablename__ = "flashcards"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    front: Mapped[str] = mapped_column(Text)
+    back: Mapped[str] = mapped_column(Text)
+    topic: Mapped[str | None] = mapped_column(Text, default=None)
+    book_title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    page_number: Mapped[int | None] = mapped_column(nullable=True)
+    box: Mapped[int] = mapped_column(default=0)  # spaced-repetition box: 0 = again ... 3 = easy
+    last_reviewed: Mapped[datetime | None] = mapped_column(default=None)
+    next_due: Mapped[datetime | None] = mapped_column(default=None)
+    review_count: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     user: Mapped["User"] = relationship()

@@ -76,8 +76,8 @@ class RetrievalService:
         embedding = self.model.encode(prefixed_query, normalize_embeddings=True)
         return embedding.tolist()
 
-    def vector_search(self, session: Session, query_embedding: list[float], limit: int = 50, book_id: int | None = None) -> list[tuple[Chunk, float]]:
-        """Run vector similarity search on child chunks. Optional book filtering."""
+    def vector_search(self, session: Session, query_embedding: list[float], limit: int = 50, book_id: int | None = None, chapter: str | None = None) -> list[tuple[Chunk, float]]:
+        """Run vector similarity search on child chunks. Optional book/chapter filtering."""
         # Query only child chunks (which have parent_id IS NOT NULL and carry embeddings)
         query_stmt = session.query(
             Chunk, (1.0 - Chunk.embedding.cosine_distance(query_embedding)).label("score")
@@ -85,13 +85,15 @@ class RetrievalService:
 
         if book_id is not None:
             query_stmt = query_stmt.filter(Chunk.book_id == book_id)
+        if chapter:
+            query_stmt = query_stmt.filter(Chunk.chapter.ilike(f"%{chapter.strip()}%"))
 
         stmt = query_stmt.order_by(text("score DESC")).limit(limit)
         results = stmt.all()
         return [(row[0], float(row[1])) for row in results]
 
-    def keyword_search(self, session: Session, query: str, limit: int = 50, book_id: int | None = None) -> list[tuple[Chunk, float]]:
-        """Run full-text search on child chunks. Optional book filtering."""
+    def keyword_search(self, session: Session, query: str, limit: int = 50, book_id: int | None = None, chapter: str | None = None) -> list[tuple[Chunk, float]]:
+        """Run full-text search on child chunks. Optional book/chapter filtering."""
         # Run synonym query expansion to increase keyword recall
         expanded_query = expand_medical_query(query)
 
@@ -106,6 +108,9 @@ class RetrievalService:
         if book_id is not None:
             sql_query += " AND book_id = :book_id"
             params["book_id"] = book_id
+        if chapter:
+            sql_query += " AND chapter ILIKE :chapter"
+            params["chapter"] = f"%{chapter.strip()}%"
 
         sql_query += " ORDER BY rank DESC LIMIT :limit"
 
@@ -150,6 +155,7 @@ class RetrievalService:
                     current = Chunk(
                         id=current.id,
                         book_id=current.book_id,
+                        book=current.book,
                         chapter=current.chapter,
                         page_number=current.page_number,
                         content=merged_content,
@@ -200,7 +206,7 @@ class RetrievalService:
         return max_vector_score
 
     def hybrid_search(
-        self, session: Session, query: str, limit: int = 5, rrf_k: int = 60, book_id: int | None = None
+        self, session: Session, query: str, limit: int = 5, rrf_k: int = 60, book_id: int | None = None, chapter: str | None = None
     ) -> list[Chunk]:
         """Perform optimized hybrid search returning parent chunks (Proposal 10).
 
@@ -214,8 +220,8 @@ class RetrievalService:
 
         # 1. Run Search
         query_embedding = self._embed_query(query)
-        vector_results = self.vector_search(session, query_embedding, limit=30, book_id=book_id)
-        keyword_results = self.keyword_search(session, query, limit=30, book_id=book_id)
+        vector_results = self.vector_search(session, query_embedding, limit=30, book_id=book_id, chapter=chapter)
+        keyword_results = self.keyword_search(session, query, limit=30, book_id=book_id, chapter=chapter)
 
         # 2. Reciprocal Rank Fusion on Parent Chunk IDs
         rrf_scores = {}  # parent_id -> rrf_score
@@ -258,6 +264,58 @@ class RetrievalService:
 
         # Return up to user limit
         return merged_parents[:limit]
+
+    def candidate_search(
+        self, session: Session, query: str, limit: int = 8, book_id: int | None = None, chapter: str | None = None
+    ) -> list[dict]:
+        """Return the pre-merge reranked candidates for the "matched sources" panel.
+
+        Same pipeline as hybrid_search but exposes every reranked parent chunk
+        (not just the ones merged into the answer context), so the user can see
+        which books/chapters actually matched and pick one to drill into.
+        """
+        query_embedding = self._embed_query(query)
+        vector_results = self.vector_search(session, query_embedding, limit=30, book_id=book_id, chapter=chapter)
+        keyword_results = self.keyword_search(session, query, limit=30, book_id=book_id, chapter=chapter)
+
+        rrf_scores: dict[int, float] = {}
+        for rank, (child_chunk, _) in enumerate(vector_results, 1):
+            pid = child_chunk.parent_id or child_chunk.id
+            if pid:
+                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + (1.0 / (60 + rank))
+        for rank, (child_chunk, _) in enumerate(keyword_results, 1):
+            pid = child_chunk.parent_id or child_chunk.id
+            if pid:
+                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + (1.0 / (60 + rank))
+
+        if not rrf_scores:
+            return []
+
+        parents = session.query(Chunk).filter(Chunk.id.in_(list(rrf_scores.keys()))).options(joinedload(Chunk.book)).all()
+        parents_map = {p.id: p for p in parents}
+        top_rrf = [parents_map[pid] for pid in sorted(rrf_scores, key=lambda pid: rrf_scores[pid], reverse=True)[:15] if pid in parents_map]
+
+        reranked = self.rerank_chunks(query, top_rrf, limit=limit)
+
+        candidates = []
+        for rank, (chunk, score) in enumerate(reranked, 1):
+            book_title = chunk.book.title if chunk.book else "Unknown Textbook"
+            clean_content = " ".join(chunk.content.split())
+            if len(clean_content) > 300:
+                snippet = clean_content[:300].rsplit(" ", 1)[0] + "…"
+            else:
+                snippet = clean_content
+            candidates.append({
+                "chunk_id": chunk.id,
+                "book_id": chunk.book_id,
+                "book_title": book_title,
+                "chapter": chunk.chapter,
+                "page_number": chunk.page_number,
+                "snippet": snippet,
+                "rank": rank,
+                "relevance_score": round(float(score), 4),
+            })
+        return candidates
 
     def get_or_generate_figure_caption(self, session: Session, figure: Figure) -> str | None:
         """Fetch figure caption. On-demand generation has been removed to reduce API overhead."""

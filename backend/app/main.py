@@ -7,6 +7,8 @@ book management, PDF ingestion, hybrid RAG query answering, and figure rendering
 import os
 import shutil
 import tempfile
+import json
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,12 +20,14 @@ from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-import json
 from app.config import settings
 from app.database import SessionLocal, engine
 from app.generation import generate_answer, generate_mcq_explanation
 from app.ingestion import ingest_book
-from app.models import Base, Book, Figure, User, MCQ, QuizAttempt, AttemptAnswer, ChatConversation, ChatMessage, MCQBookmark, ConceptBookmark
+from app.models import (
+    Base, Book, Chunk, Figure, User, MCQ, QuizAttempt, AttemptAnswer,
+    ChatConversation, ChatMessage, MCQBookmark, ConceptBookmark, Note, Flashcard
+)
 from app.auth import (
     hash_password,
     verify_password,
@@ -120,10 +124,42 @@ class QueryRequest(BaseModel):
     confidence_threshold: float = 0.55
 
 
+def _is_near_duplicate(stem_key: str, existing_stems: list[str]) -> bool:
+    """True if the given MCQ stem is effectively a duplicate of an existing stem.
+
+    Because only 30 recent same-book stems are in context, similarity to a
+    larger historical bank is checked post-hoc with subsequence + fuzzy ratio:
+      - if one stem contains the other (normalized) → duplicate
+      - difflib ratio > 0.8 → near-duplicate
+    """
+    import difflib
+
+    normalized = " ".join(stem_key.split())
+    if not normalized:
+        return True
+    for existing in existing_stems:
+        existing_norm = " ".join(existing.split())
+        if not existing_norm:
+            continue
+        if normalized == existing_norm:
+            return True
+        # Substring containment on >= 60-char stems is a strong dup signal
+        if len(normalized) >= 60 and (
+            normalized in existing_norm or existing_norm in normalized
+        ):
+            return True
+        ratio = difflib.SequenceMatcher(None, normalized, existing_norm).ratio()
+        if ratio > 0.8:
+            return True
+    return False
+
+
 class ChatQueryRequest(BaseModel):
     query: str
     conversation_id: int | None = None
     confidence_threshold: float = 0.55
+    book_id: int | None = None
+    chapter: str | None = None
 
 
 class ConceptBookmarkCreate(BaseModel):
@@ -267,6 +303,42 @@ def delete_book(
     db.delete(book)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.get("/api/books/{book_id}/chapters")
+def list_book_chapters(
+    book_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Returns distinct chapter headings for a book (for scoped chat retrieval).
+
+    Filters out junk/watermark slugs (e.g. 'mebooksfree.com', blank, single-char)
+    so the chapter dropdown stays clean.
+    """
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    rows = (
+        db.query(Chunk.chapter)
+        .filter(Chunk.book_id == book_id)
+        .filter(Chunk.chapter.isnot(None))
+        .distinct()
+        .all()
+    )
+    chapters = []
+    for (c,) in rows:
+        name = (c or "").strip()
+        if not name or len(name) < 2:
+            continue
+        lower = name.lower()
+        if "mebooksfree" in lower or "watermark" in lower or "publisher" in lower:
+            continue
+        if name not in chapters:
+            chapters.append(name)
+    chapters.sort(key=str.lower)
+    return {"book_id": book_id, "book_title": book.title, "chapters": chapters}
 
 
 @app.post(
@@ -494,6 +566,7 @@ class GenerateAiQuizRequest(BaseModel):
     book_id: int | None = None
     page_number: int | None = None
     count: int | None = None
+    difficulty: int | None = None  # 1 (easy) - 5 (hard); falls back to AI_MCQ_DIFFICULTY env
 
 
 @app.post("/api/chat/generate-ai-quiz")
@@ -519,15 +592,29 @@ def generate_ai_quiz(
         if page_match:
             page_num = int(page_match.group(1))
 
+    # 1. Resolve requested count: multiples of 5 only, max 20
+    ALLOWED_COUNTS = (5, 10, 15, 20)
     mcq_count = req.count or 5
     count_match = re.search(r"(\d+)\s*(?:questions?|mcqs?|items?)", prompt_text, re.IGNORECASE)
     if count_match:
         try:
-            parsed_count = int(count_match.group(1))
-            if 1 <= parsed_count <= 20:
-                mcq_count = parsed_count
+            mcq_count = int(count_match.group(1))
         except ValueError:
             pass
+    if mcq_count not in ALLOWED_COUNTS:
+        raise HTTPException(
+            status_code=400,
+            detail="count must be a multiple of 5 between 5 and 20 (5, 10, 15, or 20).",
+        )
+
+    # 1b. Resolve difficulty: explicit request > AI_MCQ_DIFFICULTY env override > unspecified
+    difficulty = req.difficulty
+    if difficulty is None:
+        env_diff = os.environ.get("AI_MCQ_DIFFICULTY", "").strip()
+        if env_diff.isdigit():
+            difficulty = int(env_diff)
+    if difficulty is not None and not (1 <= difficulty <= 5):
+        raise HTTPException(status_code=400, detail="difficulty must be an integer between 1 and 5.")
 
     # 2. Retrieve textbook context
     retrieved_chunks = []
@@ -553,9 +640,20 @@ def generate_ai_quiz(
         context_str = f"Topic: {prompt_text}"
 
     # 3. Prompt DeepSeek LLM with strict JSON schema
+    difficulty_line = ""
+    if difficulty is not None:
+        difficulty_line = (
+            f"TARGET DIFFICULTY LEVEL: {difficulty}/5.\n"
+            "Scale guide: 1 = simple recall of well-known facts; 2 = straightforward application; "
+            "3 = standard board-style with moderately challenging distractors; "
+            "4 = complex multi-step clinical reasoning; "
+            "5 = very high-yield questions with subtle, ambiguous distractors requiring deep integration.\n"
+            "Write EVERY question in this set at the target difficulty level, and vary the vignette style accordingly.\n\n"
+        )
     system_prompt = (
         "You are an expert medical educator and board exam question writer. "
         "Generate high-yield, USMLE/board-style Multiple Choice Questions based strictly on the provided medical textbook context.\n"
+        f"{difficulty_line}"
         "Return ONLY valid JSON matching this exact structure:\n"
         "{\n"
         '  "quiz_title": "Short descriptive topic title",\n'
@@ -572,12 +670,6 @@ def generate_ai_quiz(
         "}"
     )
 
-    user_prompt = (
-        f"Generate {mcq_count} high-yield MCQs based on the following context and prompt:\n\n"
-        f"USER PROMPT: {prompt_text}\n\n"
-        f"TEXTBOOK CONTEXT:\n{context_str[:6000]}"
-    )
-
     if not settings.deepseek_api_key or settings.deepseek_api_key == "sk-dummy":
         raise HTTPException(
             status_code=400,
@@ -589,32 +681,81 @@ def generate_ai_quiz(
         base_url=settings.deepseek_base_url
     )
 
-    try:
-        completion = client.chat.completions.create(
-            model=settings.deepseek_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.3,
+    # 3b. Anti-repeat generation (F3.5): feed recent same-book MCQs into the prompt
+    # and drop near-duplicates after generation.
+    recent_existing = []
+    existing_query = db.query(MCQ)
+    if req.book_id:
+        existing_query = existing_query.filter(MCQ.book_id == req.book_id)
+    # no_autoflush: the chat pipeline may leave transient Chunk objects pending on
+    # the session; autoflushing them here is wasteful and noisy (SAWarning).
+    with db.no_autoflush:
+        recent_existing = existing_query.order_by(MCQ.id.desc()).limit(30).all()
+    existing_stems = [
+        (m.question_text or "").strip().lower()
+        for m in recent_existing
+        if m.question_text and (m.question_text or "").strip()
+    ]
+    dedup_context_lines = "\n".join(
+        f"- {(m.question_text or '')[:200]}" for m in recent_existing
+    ) or "None"
+    duplicates_skipped = 0
+    all_questions: list[dict] = []
+    all_new_stems: list[str] = []
+
+    # 3c. Generate in batches of 5 so the LLM stays reliable and focused.
+    BATCH_SIZE = 5
+    quiz_title = prompt_text[:40].title()
+    for batch_start in range(0, mcq_count, BATCH_SIZE):
+        batch_target = min(BATCH_SIZE, mcq_count - batch_start)
+        user_prompt = (
+            f"USER PROMPT: {prompt_text}\n\n"
+            f"Generate exactly {batch_target} high-yield MCQs from this prompt, grounded in the textbook context.\n\n"
+            f"TEXTBOOK CONTEXT:\n{context_str[:6000]}\n\n"
+            "RECENTLY GENERATED QUESTIONS FROM THIS BOOK (do NOT repeat these stems, clinical scenarios, "
+            "answer options, or correct-answer patterns — write fresh vignettes):\n"
+            f"{dedup_context_lines}"
         )
-        raw_res = completion.choices[0].message.content or "{}"
-        quiz_data = json.loads(raw_res)
-    except Exception as e:
-        logger.error(f"AI Quiz Generation error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate quiz: {e}")
 
-    quiz_title = quiz_data.get("quiz_title") or prompt_text[:40].title()
-    questions = quiz_data.get("questions", [])
+        try:
+            completion = client.chat.completions.create(
+                model=settings.deepseek_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3,
+            )
+            raw_res = completion.choices[0].message.content or "{}"
+            quiz_data = json.loads(raw_res)
+        except Exception as e:
+            logger.error(f"AI Quiz Generation error (batch {batch_start // BATCH_SIZE + 1}): {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to generate quiz: {e}")
 
-    if not questions:
-        raise HTTPException(status_code=500, detail="LLM did not return valid question sets.")
+        batch_questions = quiz_data.get("questions", [])
+        if not batch_questions:
+            raise HTTPException(status_code=500, detail="LLM did not return valid question sets.")
+
+        for item in batch_questions:
+            stem = (item.get("question_text") or "").strip()
+            stem_key = stem.lower()
+            if not stem_key or _is_near_duplicate(stem_key, existing_stems + all_new_stems):
+                duplicates_skipped += 1
+                continue
+            all_questions.append(item)
+            all_new_stems.append(stem_key)
+
+    if not all_questions:
+        raise HTTPException(
+            status_code=500,
+            detail="All generated questions were duplicates of existing MCQs. Try a different prompt or topic.",
+        )
 
     quiz_set_id = f"quiz_set_{uuid.uuid4().hex[:8]}"
     created_mcqs = []
 
-    for item in questions:
+    for item in all_questions:
         book_id = req.book_id
         page_ref = item.get("source_page") or page_num
         source_book_name = item.get("source_book") or "Medical Textbook"
@@ -633,6 +774,7 @@ def generate_ai_quiz(
             topic=quiz_title,
             main_category="AI MCQs",
             sub_category=source_book_name,
+            difficulty=difficulty,
             explanation_markdown=explanation_txt,
             status="ready",
         )
@@ -651,6 +793,8 @@ def generate_ai_quiz(
         "quiz_set_id": quiz_set_id,
         "quiz_set_title": quiz_title,
         "total_questions": len(created_mcqs),
+        "duplicates_skipped": duplicates_skipped,
+        "difficulty": difficulty,
         "mcqs": [
             {
                 "id": m.id,
@@ -658,6 +802,7 @@ def generate_ai_quiz(
                 "options": m.options,
                 "correct_option": m.correct_option,
                 "topic": m.topic,
+                "difficulty": m.difficulty,
                 "explanation_markdown": m.explanation_markdown,
             }
             for m in created_mcqs
@@ -677,6 +822,7 @@ def get_ai_quizzes_history(
             MCQ.quiz_set_title,
             func.count(MCQ.id).label("question_count"),
             func.max(MCQ.topic).label("topic"),
+            func.max(MCQ.difficulty).label("difficulty"),
         )
         .filter(MCQ.quiz_set_id != None)
         .group_by(MCQ.quiz_set_id, MCQ.quiz_set_title)
@@ -690,6 +836,7 @@ def get_ai_quizzes_history(
             "quiz_set_title": r.quiz_set_title or "AI Quiz Set",
             "question_count": r.question_count,
             "topic": r.topic,
+            "difficulty": r.difficulty,
         }
         for r in results
     ]
@@ -715,6 +862,7 @@ class StartQuizRequest(BaseModel):
     sub_categories: list[str] | None = None
     num_questions: int = 10
     exclude_mastered: bool = False
+    drill_wrong: bool = False                 # answer-only the user's missed MCQs
     timer_mode: str = "none"                      # "none" | "session" | "per_question"
     timer_value: int | None = None                # minutes or seconds
     feedback_mode: str = "tutor"                  # "tutor" | "board"
@@ -741,6 +889,20 @@ def start_quiz_endpoint(
     
     query = db.query(MCQ)
     
+    # Drill mode: only previously-missed questions (user-scoped by construct)
+    if req.drill_wrong:
+        wrong_ids = (
+            db.query(AttemptAnswer.mcq_id)
+            .join(QuizAttempt, QuizAttempt.id == AttemptAnswer.quiz_attempt_id)
+            .filter(
+                QuizAttempt.user_id == current_user.id,
+                AttemptAnswer.is_correct.is_(False),
+            )
+            .distinct()
+            .subquery()
+        )
+        query = query.filter(MCQ.id.in_(wrong_ids))
+
     # Topic filters
     if req.quiz_set_id:
         query = query.filter(MCQ.quiz_set_id == req.quiz_set_id)
@@ -917,6 +1079,55 @@ def get_quiz_attempt(
     }
 
 
+@app.get("/api/quiz/wrong")
+def get_wrong_questions(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Returns the user's previously-missed MCQs (most recently missed first) for drill practice."""
+    wrong_answers = (
+        db.query(AttemptAnswer)
+        .join(QuizAttempt, AttemptAnswer.quiz_attempt_id == QuizAttempt.id)
+        .filter(
+            QuizAttempt.user_id == current_user.id,
+            AttemptAnswer.is_correct.is_(False),
+        )
+        .order_by(AttemptAnswer.id.desc())
+        .limit(200)
+        .all()
+    )
+
+    mcq_ids: list[int] = []
+    seen: set[int] = set()
+    for wa in wrong_answers:
+        if wa.mcq_id not in seen:
+            seen.add(wa.mcq_id)
+            mcq_ids.append(wa.mcq_id)
+
+    if not mcq_ids:
+        return {"questions": [], "total": 0}
+
+    mcqs = db.query(MCQ).filter(MCQ.id.in_(mcq_ids)).all()
+    mcq_map = {m.id: m for m in mcqs}
+
+    questions = []
+    for mid in mcq_ids:
+        m = mcq_map.get(mid)
+        if not m:
+            continue
+        questions.append({
+            "id": m.id,
+            "question_text": m.question_text,
+            "options": m.options,
+            "correct_option": m.correct_option,
+            "explanation_markdown": m.explanation_markdown,
+            "topic": m.topic,
+            "difficulty": m.difficulty,
+        })
+
+    return {"questions": questions, "total": len(questions)}
+
+
 # ======================== CONVERSATIONAL CHAT HISTORY ========================
 
 @app.post("/api/chat/query")
@@ -975,7 +1186,9 @@ def chat_query_endpoint(
         session=db, 
         query=req.query, 
         confidence_threshold=req.confidence_threshold,
-        history=history
+        history=history,
+        book_id=req.book_id,
+        chapter=req.chapter
     )
 
     # Save messages to database
@@ -1003,6 +1216,25 @@ def chat_query_endpoint(
         "conversation_id": conv_id,
         "conversation_title": conv.title,
         "answer": answer_dict
+    }
+
+
+@app.get("/api/chat/source/{chunk_id}")
+def get_chat_source_full(
+    chunk_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Returns the full text of a retrieved source chunk for the expandable sources panel."""
+    chunk = db.query(Chunk).filter(Chunk.id == chunk_id).first()
+    if not chunk:
+        raise HTTPException(status_code=404, detail="Chunk not found.")
+    return {
+        "chunk_id": chunk.id,
+        "book_title": chunk.book.title if chunk.book else "Unknown Textbook",
+        "chapter": chunk.chapter,
+        "page_number": chunk.page_number,
+        "content": chunk.content,
     }
 
 
@@ -1319,6 +1551,412 @@ def get_detailed_stats(
         "history_trend": trend,
         "category_breakdown": formatted_breakdown
     }
+
+
+# ======================== STUDY: NOTES & FLASHCARDS ========================
+# Personal study material is strictly per-user (shared MCQ bank stays global).
+
+class NoteCreateRequest(BaseModel):
+    title: str = "Untitled Note"
+    content: str
+    book_title: str | None = None
+    page_number: int | None = None
+    source_context: str | None = None
+
+
+class FlashcardCreateRequest(BaseModel):
+    front: str
+    back: str
+    topic: str | None = None
+    book_title: str | None = None
+    page_number: int | None = None
+
+
+@app.get("/api/notes")
+def list_notes(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Lists the current user's study notes (newest first)."""
+    notes = db.query(Note).filter(Note.user_id == current_user.id).order_by(Note.updated_at.desc()).all()
+    return [
+        {
+            "id": n.id,
+            "title": n.title,
+            "content": n.content,
+            "book_title": n.book_title,
+            "page_number": n.page_number,
+            "source_context": n.source_context,
+            "created_at": n.created_at.isoformat() if n.created_at else None,
+            "updated_at": n.updated_at.isoformat() if n.updated_at else None,
+        }
+        for n in notes
+    ]
+
+
+@app.post("/api/notes", status_code=status.HTTP_201_CREATED)
+def create_note(
+    req: NoteCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Creates a new study note for the current user."""
+    if not req.content.strip():
+        raise HTTPException(status_code=400, detail="Note content cannot be empty.")
+    note = Note(
+        user_id=current_user.id,
+        title=req.title.strip() or "Untitled Note",
+        content=req.content.strip(),
+        book_title=req.book_title,
+        page_number=req.page_number,
+        source_context=req.source_context,
+    )
+    db.add(note)
+    db.commit()
+    db.refresh(note)
+    return {
+        "id": note.id,
+        "title": note.title,
+        "content": note.content,
+        "book_title": note.book_title,
+        "page_number": note.page_number,
+        "source_context": note.source_context,
+        "created_at": note.created_at.isoformat() if note.created_at else None,
+        "updated_at": note.updated_at.isoformat() if note.updated_at else None,
+    }
+
+
+@app.put("/api/notes/{note_id}")
+def update_note(
+    note_id: int,
+    req: NoteCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Updates an existing note (title/content/source metadata)."""
+    note = db.query(Note).filter(Note.id == note_id, Note.user_id == current_user.id).first()
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found.")
+    note.title = req.title.strip() or note.title
+    note.content = req.content.strip()
+    note.book_title = req.book_title
+    note.page_number = req.page_number
+    note.source_context = req.source_context
+    db.commit()
+    db.refresh(note)
+    return {
+        "id": note.id,
+        "title": note.title,
+        "content": note.content,
+        "book_title": note.book_title,
+        "page_number": note.page_number,
+        "source_context": note.source_context,
+        "updated_at": note.updated_at.isoformat() if note.updated_at else None,
+    }
+
+
+@app.delete("/api/notes/{note_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_note(
+    note_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Deletes the current user's note."""
+    note = db.query(Note).filter(Note.id == note_id, Note.user_id == current_user.id).first()
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found.")
+    db.delete(note)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.get("/api/flashcards")
+def list_flashcards(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Lists the current user's flashcards (not-yet-due ones first for review sessions)."""
+    due_first = _due_flashcard_sorter(db, current_user)
+    return [
+        {
+            "id": f.id,
+            "front": f.front,
+            "back": f.back,
+            "topic": f.topic,
+            "book_title": f.book_title,
+            "page_number": f.page_number,
+            "box": f.box,
+            "review_count": f.review_count,
+            "last_reviewed": f.last_reviewed.isoformat() if f.last_reviewed else None,
+            "next_due": f.next_due.isoformat() if f.next_due else None,
+            "created_at": f.created_at.isoformat() if f.created_at else None,
+        }
+        for f in due_first
+    ]
+
+
+@app.get("/api/flashcards/review")
+def get_flashcards_for_review(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Returns cards that are due now (plus a few new ones) for a review session."""
+    now = datetime.utcnow()
+    due = (
+        db.query(Flashcard)
+        .filter(
+            Flashcard.user_id == current_user.id,
+            (Flashcard.next_due.is_(None)) | (Flashcard.next_due <= now),
+        )
+        .order_by(Flashcard.next_due.asc().nulls_first())
+        .limit(50)
+        .all()
+    )
+    return [
+        {
+            "id": f.id,
+            "front": f.front,
+            "back": f.back,
+            "topic": f.topic,
+            "box": f.box,
+            "review_count": f.review_count,
+        }
+        for f in due
+    ]
+
+
+@app.post("/api/flashcards", status_code=status.HTTP_201_CREATED)
+def create_flashcard(
+    req: FlashcardCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Creates a new flip-card for the current user."""
+    if not req.front.strip() or not req.back.strip():
+        raise HTTPException(status_code=400, detail="Both the front and back of a flashcard are required.")
+    card = Flashcard(
+        user_id=current_user.id,
+        front=req.front.strip(),
+        back=req.back.strip(),
+        topic=req.topic,
+        book_title=req.book_title,
+        page_number=req.page_number,
+    )
+    db.add(card)
+    db.commit()
+    db.refresh(card)
+    return {
+        "id": card.id,
+        "front": card.front,
+        "back": card.back,
+        "topic": card.topic,
+        "book_title": card.book_title,
+        "page_number": card.page_number,
+        "box": card.box,
+    }
+
+
+@app.put("/api/flashcards/{card_id}")
+def update_flashcard(
+    card_id: int,
+    req: FlashcardCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Edits the front/back/metadata of an existing card."""
+    card = db.query(Flashcard).filter(
+        Flashcard.id == card_id, Flashcard.user_id == current_user.id
+    ).first()
+    if not card:
+        raise HTTPException(status_code=404, detail="Flashcard not found.")
+    card.front = req.front.strip() or card.front
+    card.back = req.back.strip() or card.back
+    card.topic = req.topic
+    card.book_title = req.book_title
+    card.page_number = req.page_number
+    db.commit()
+    db.refresh(card)
+    return {"id": card.id, "front": card.front, "back": card.back, "topic": card.topic}
+
+
+@app.delete("/api/flashcards/{card_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_flashcard(
+    card_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Deletes the current user's flashcard."""
+    card = db.query(Flashcard).filter(
+        Flashcard.id == card_id, Flashcard.user_id == current_user.id
+    ).first()
+    if not card:
+        raise HTTPException(status_code=404, detail="Flashcard not found.")
+    db.delete(card)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+class FlashcardReviewRequest(BaseModel):
+    """Result of a single card flip: 0=again, 1=hard, 2=good, 3=easy."""
+
+    rating: int
+
+
+@app.post("/api/flashcards/{card_id}/review")
+def review_flashcard(
+    card_id: int,
+    req: FlashcardReviewRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Applies bounded spaced repetition (Leitner-style) after a card flip.
+
+    Boxes 0..3 map to intervals of ~Incorrect / 1d / 3d / 7d. Ratings again/hard
+    demote or hold; good/easy promote. Intervals are deliberately modest so the
+    reviewer re-trips the biggest gaps within a week.
+    """
+    if req.rating not in (0, 1, 2, 3):
+        raise HTTPException(status_code=400, detail="rating must be 0 (again), 1 (hard), 2 (good), or 3 (easy).")
+    card = db.query(Flashcard).filter(
+        Flashcard.id == card_id, Flashcard.user_id == current_user.id
+    ).first()
+    if not card:
+        raise HTTPException(status_code=404, detail="Flashcard not found.")
+
+    now = datetime.utcnow()
+    if req.rating == 0:  # forgot it — back to box 0
+        card.box = 0
+        card.next_due = now + timedelta(minutes=10)
+    elif req.rating == 1:  # hard — same box, sooner
+        card.box = max(card.box - 1, 0)
+        card.next_due = now + timedelta(days=1)
+    else:
+        card.box = min(card.box + 1, 3)
+        interval_days = {1: 1, 2: 3, 3: 7}[card.box]
+        card.next_due = now + timedelta(days=interval_days)
+
+    card.last_reviewed = now
+    card.review_count = (card.review_count or 0) + 1
+    db.commit()
+    db.refresh(card)
+    return {"id": card.id, "box": card.box, "next_due": card.next_due.isoformat(), "review_count": card.review_count}
+
+
+def _due_flashcard_sorter(db: Session, current_user: User) -> list[Flashcard]:
+    """Order cards for the list view: due next, then unreviewed, then newest."""
+    now = datetime.utcnow()
+    cards = db.query(Flashcard).filter(Flashcard.user_id == current_user.id).all()
+
+    def sort_key(c: Flashcard) -> tuple[int, int]:
+        # Due-first: 0 = due, 1 = new (unreviewed), 2 = scheduled later; newest id last-breaks.
+        if c.next_due is not None and c.next_due <= now:
+            return (0, c.next_due.timestamp())
+        if c.review_count == 0 or c.next_due is None:
+            return (1, c.id)
+        return (2, c.next_due.timestamp())
+
+    return sorted(cards, key=sort_key)
+
+
+# ======================== EXPORT ========================
+
+@app.get("/api/export/mcqs")
+def export_mcqs_csv(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Download the MCQ bank as a CSV (global shared bank — any student may export)."""
+    import csv
+    import io
+
+    mcqs = db.query(MCQ).order_by(MCQ.id.asc()).all()
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "id", "quiz_set_title", "topic", "main_category", "sub_category",
+        "difficulty", "question_text", "option_a", "option_b", "option_c",
+        "option_d", "correct_option", "explanation_markdown",
+    ])
+    for m in mcqs:
+        opts = m.options if isinstance(m.options, dict) else {}
+        writer.writerow([
+            m.id, m.quiz_set_title, m.topic, m.main_category, m.sub_category,
+            m.difficulty if m.difficulty is not None else "",
+            m.question_text,
+            opts.get("A", ""), opts.get("B", ""), opts.get("C", ""), opts.get("D", ""),
+            m.correct_option,
+            (m.explanation_markdown or "").replace("\n", " "),
+        ])
+    csv_content = "\ufeff" + buf.getvalue()  # BOM so Excel renders UTF-8 correctly
+    return Response(
+        content=csv_content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="mednama_mcq_bank.csv"'},
+    )
+
+
+@app.get("/api/export/notes")
+def export_notes_csv(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Download the current user's study notes as a CSV."""
+    import csv
+    import io
+
+    notes = db.query(Note).filter(Note.user_id == current_user.id).order_by(Note.updated_at.desc()).all()
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["id", "title", "content", "book_title", "page_number", "source_context", "updated_at"])
+    for n in notes:
+        writer.writerow([
+            n.id, n.title, (n.content or "").replace("\n", " "),
+            n.book_title or "", n.page_number or "",
+            n.source_context or "",
+            n.updated_at.strftime("%Y-%m-%d %H:%M") if n.updated_at else "",
+        ])
+    csv_content = "\ufeff" + buf.getvalue()
+    return Response(
+        content=csv_content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="mednama_notes.csv"'},
+    )
+
+
+@app.get("/api/export/bookmarks")
+def export_bookmarks_csv(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Download the current user's concept bookmarks as a CSV."""
+    import csv
+    import io
+
+    bookmarks = db.query(ConceptBookmark).filter(
+        ConceptBookmark.user_id == current_user.id
+    ).order_by(ConceptBookmark.created_at.desc()).all()
+
+    mcq_bookmarks = db.query(MCQBookmark).filter(
+        MCQBookmark.user_id == current_user.id
+    ).order_by(MCQBookmark.created_at.desc()).all()
+    mcq_map = {b.mcq_id: b for b in mcq_bookmarks}
+    mcqs = db.query(MCQ).filter(MCQ.id.in_(list(mcq_map.keys()))).all() if mcq_map else []
+    mcq_text = {m.id: m.question_text for m in mcqs}
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["type", "content", "book_title", "page_number", "created_at"])
+    for b in bookmarks:
+        writer.writerow(["concept", (b.content or "").replace("\n", " "), b.book_title or "", b.page_number or "", b.created_at.strftime("%Y-%m-%d %H:%M") if b.created_at else ""])
+    for mcq_mark, m in mcq_map.items():
+        writer.writerow(["mcq", (mcq_text.get(mcq_mark) or "").replace("\n", " "), "", "", m.created_at.strftime("%Y-%m-%d %H:%M") if m.created_at else ""])
+
+    csv_content = "\ufeff" + buf.getvalue()
+    return Response(
+        content=csv_content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="mednama_bookmarks.csv"'},
+    )
 
 
 
