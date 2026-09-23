@@ -102,7 +102,8 @@ The books were added for **trust, MCQ content and level setting** (undergraduate
 5. **DeepSeek client:** `OpenAI(timeout=60, max_retries=1)` in all three places, `max_tokens` set, and thinking/reasoning turned off or lowered for chat and MCQs if the model supports it.
 6. **Partial-success MCQs:** retry a failed batch once, keep the batches that succeeded, return `{created, failed_batches}`, and return 504 with a JSON `detail` for a provider timeout.
 7. **Backend logging:** app loggers (`app.generation`, `app.retrieval`) have no handler, so INFO lines such as "Retrieval confidence low" never appear in `docker logs`. Only uvicorn access lines (`POST /api/... 200`) and warnings/errors show. Fix: `logging.basicConfig(level=LOG_LEVEL, format=...)` in `main.py`, and log per request: query, confidence, gate result, top chunk IDs, DeepSeek latency and errors. `backend/scripts/diagnose_query.py` is a read-only diagnostic until then.
-8. **Quiz UI:** give it its own `AbortController` (about 180 s) and a clear timeout message, matching `useChat.ts`.
+8. **One-command diagnosis script** (`backend/scripts/run_diagnosis.py`, added): works on the Windows PC and on the NAS. It auto-detects the running backend container (`mednama-backend` or any `*backend*` container, or `--container NAME`), copies `diagnose_query.py` into the container's `/tmp`, finds the image's backend directory, and runs each query. It saves the combined report to `diagnosis_<timestamp>.txt`. `--local` runs it without Docker against a reachable DB (for example the PC's `localhost:5433`). It is read-only: no DB writes, no rebuild or restart, no DeepSeek calls, so it doesn't interfere with the layered image or the database.
+9. **Quiz UI:** give it its own `AbortController` (about 180 s) and a clear timeout message, matching `useChat.ts`.
 
 ### Phase 2: Make it fast
 1. Run the MCQ batches **in parallel** (`ThreadPoolExecutor` or `AsyncOpenAI` + `gather`), then merge and deduplicate.
