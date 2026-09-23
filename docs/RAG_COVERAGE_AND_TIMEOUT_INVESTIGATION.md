@@ -81,6 +81,7 @@ It already exists: `/api/chat/generate-ai-quiz` (`main.py:572`) generates ground
   - **AI MCQs:** `generate_ai_quiz` makes **one DeepSeek call per batch of 5, one after another** (`main.py:707`). 20 MCQs means 4 sequential calls, taking 60–120 s or more, so it fails every time.
 - **`proxySafeFetch` makes it worse.** It retries once on a network error or a plain-text 500, assuming "the backend never processed the request". That is not true for a proxy timeout. The backend is still running the first request when the retry fires. You pay for DeepSeek twice, can end up with duplicate MCQ sets, and the second attempt times out too.
 - The DeepSeek `OpenAI(...)` client has no `timeout` set (the SDK default is 600 s with 2 retries), so a slow upstream response can hold a worker for minutes.
+- **Real backend 500s for MCQs:** if any one batch returns bad JSON or hits an API error, `generate_ai_quiz` raises `HTTPException(500)`. The batches that already succeeded are thrown away, so 20 MCQs is 4 chances to fail. Fix: retry that batch once, then keep the questions that succeeded and report the partial result.
 - The endpoints are synchronous `def` handlers on one uvicorn process. FastAPI runs them in its thread pool (about 40 threads), so this is not a hard block, but the CPU work (reranking, embedding) competes for resources.
 
 **Fixes, in order:**
@@ -96,6 +97,30 @@ It already exists: `/api/chat/generate-ai-quiz` (`main.py:572`) generates ground
 Files: `docker/frontend.Dockerfile`, `NAS/frontend.Dockerfile`, `frontend/src/lib/proxyFetch.ts`, `frontend/src/hooks/useChat.ts`, `frontend/src/components/views/QuizView.tsx`, `backend/app/main.py` (`generate_ai_quiz`), `backend/app/generation.py`.
 
 Verification: on the NAS, time `curl -X POST /api/chat/generate-ai-quiz` with count 20, first directly against backend:8000 and then through :3000. Before the fix, the :3000 call should fail at about 30 s. After the fix, it should succeed. Check the backend logs to confirm each request runs only once (no duplicate DeepSeek calls).
+
+## Part C: Change the approach from "books only" to "books first, AI fills the gaps, clearly labelled"
+
+**Why:** the books were added to make answers more trustworthy, to give MCQs real content, and to set the level (undergraduate, FCPS-I, FCPS-II/resident). They were not meant as a hard limit. CPSP papers test current terms, newer concepts and updated guidelines that a textbook edition may not include (for example "paradoxical aciduria" in HPS). Answering "books only, refuse otherwise" fails exactly the questions FCPS candidates need help with. A clearly labelled answer is more useful than a refusal.
+
+**Design:**
+1. **Chat answers in two labelled parts:**
+   - **From your textbooks**: cited with book and page, and checked on the server with `validate_generation` (unchanged).
+   - **Additional clinical knowledge (AI, not from the textbooks)**: current terms, guidelines, exam tips and anything the books don't cover. No citations are allowed in this part.
+   - Refuse only for questions that aren't medical, or when the model is actually unsure.
+   - New JSON fields: `textbook_answer_markdown`, `supplementary_markdown`, `grounding` (`textbook` | `partial` | `ai_only`).
+2. **Grounding badge in the UI:** "Textbook-backed", "Partly backed" or "AI knowledge only", so the student can judge how much to trust the answer.
+3. **Level setting** (`undergraduate` | `fcps1` | `fcps2`), stored per user and passed to chat and MCQ generation. It controls depth, terms and question style. The books set the baseline for each level.
+4. **MCQs:**
+   - Use the retrieved passages for the facts and the level, but allow current CPSP-style concepts.
+   - Tag each question `book_sourced` (with a validated book and page) or `ai_supplemented`, and never attach a made-up page number.
+   - When retrieval finds nothing, generate the set as `ai_supplemented` and show a clear notice, instead of the current silent `Topic: …` fallback.
+5. **Safety:**
+   - Keep server-side citation checks.
+   - The prompt forbids citations in the supplementary part, and any stray book/page reference there gets stripped.
+   - Add a "Report wrong answer" button on answers and MCQs, stored for admin review.
+6. **Later:** ingest current sources (guideline summaries, past-paper topic lists, a review book), so that more of the "latest terms" part moves from AI knowledge into cited content.
+
+Files: `backend/app/generation.py` (prompt, JSON shape, fallback removal), `backend/app/main.py` (level on requests, MCQ tagging and validation), `backend/app/models.py` plus an alembic migration (user level, MCQ `grounding`, reports), and the frontend chat and quiz views (two-part rendering, badge, level selector).
 
 ## Critical files
 - `backend/app/retrieval.py`: `calculate_confidence`, `keyword_search`, `MEDICAL_SYNONYMS`, reranker
