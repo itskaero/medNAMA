@@ -1,5 +1,13 @@
-"""Answer generation pipeline: queries DeepSeek, grounds in hybrid search context,
-and performs strict server-side citation/figure validation.
+"""Answer generation pipeline: retrieves textbook context, asks DeepSeek for a
+books-first answer with a clearly labelled AI supplement, and validates
+citations/figures server-side.
+
+Answer shape (answer_markdown is kept for every existing consumer; the other
+fields let the UI label how much of the answer is textbook-backed):
+    textbook_answer_markdown  cited facts from the retrieved passages
+    supplementary_markdown    AI clinical knowledge the books don't state (never cited)
+    grounding                 'textbook' | 'partial' | 'ai_only' | 'none'
+    status                    'ok' | 'llm_error' | 'not_configured'
 """
 
 import json
@@ -7,34 +15,52 @@ import logging
 import re
 from typing import Any
 
-from openai import OpenAI
 from sqlalchemy.orm import Session
 
-from app.config import settings
-from app.retrieval import retrieval_service
+from app.llm import LLMNotConfigured, chat_completion
 from app.models import Book
+from app.retrieval import retrieval_service
 
 logger = logging.getLogger(__name__)
 
-# Fallback response when retrieval confidence is low
+# Kept for callers that still compare against it; chat no longer returns it.
 NOT_COVERED_RESPONSE = {
     "answer_markdown": "I am sorry, but the answer to your question is not covered in the provided textbooks.",
     "citations": [],
     "figures": [],
     "sources": [],
 }
+SUPPLEMENT_HEADING = "**Beyond the textbooks (AI clinical knowledge, not from your books):**"
+
+LEVEL_GUIDANCE = {
+    "undergraduate": "The reader is an MBBS undergraduate: explain clearly, define terms, keep it exam-focused.",
+    "fcps1": "The reader is preparing for FCPS-I (basic sciences): emphasise mechanisms, physiology, pathology and pharmacology.",
+    "fcps2": "The reader is a resident preparing for FCPS-II: emphasise clinical management, guidelines, doses and pitfalls.",
+}
+DEFAULT_LEVEL_GUIDANCE = (
+    "The reader is a medical student or resident preparing for MBBS/FCPS (CPSP) exams: "
+    "be concise, high-yield and exam-oriented."
+)
+
+# Legacy refusal / error texts that must not be replayed as conversation history.
+_REFUSAL_MARKERS = (
+    "i am sorry, but the answer to your question is not covered",
+    "the ai service did not respond",
+)
+
+
+def is_refusal_text(text: str) -> bool:
+    lower = (text or "").strip().lower()
+    return any(lower.startswith(m) for m in _REFUSAL_MARKERS)
 
 
 def clean_text_references(text: str, stripped_citations: list[dict], stripped_figures: list[dict]) -> str:
     """Scan response text and strip references to deleted citations or figures."""
     cleaned = text
 
-    # Remove stripped figure references, e.g. [Figure 9] or (Figure 9) or [Figure ID: 9]
     for fig in stripped_figures:
         fig_id = fig.get("id")
-        label = fig.get("figure_label", f"Figure {fig_id}")
-
-        # Patterns matching: [Figure 9], (Figure 9), [Figure ID: 9], etc.
+        label = re.escape(str(fig.get("figure_label", f"Figure {fig_id}")))
         patterns = [
             re.compile(rf"\[{label}\]", re.IGNORECASE),
             re.compile(rf"\({label}\)", re.IGNORECASE),
@@ -44,12 +70,9 @@ def clean_text_references(text: str, stripped_citations: list[dict], stripped_fi
         for pattern in patterns:
             cleaned = pattern.sub("", cleaned)
 
-    # Remove stripped citations, e.g. [Microbiology, Page 8] or (Microbiology, Page 8)
     for cit in stripped_citations:
         title = re.escape(cit.get("book_title", ""))
         page = cit.get("page_number")
-
-        # Patterns matching: [Book Title, Page 8], (Book Title, Page 8), [Book Title, p. 8], etc.
         patterns = [
             re.compile(rf"\[{title},\s*(?:Page|p\.)\s*{page}\]", re.IGNORECASE),
             re.compile(rf"\({title},\s*(?:Page|p\.)\s*{page}\)", re.IGNORECASE),
@@ -57,11 +80,19 @@ def clean_text_references(text: str, stripped_citations: list[dict], stripped_fi
         for pattern in patterns:
             cleaned = pattern.sub("", cleaned)
 
-    # Clean up double spaces or brackets left over from replacements
-    cleaned = re.sub(r"\s+", " ", cleaned)
+    # Collapse whitespace runs without destroying markdown line breaks.
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r"\[\s*\]", "", cleaned)
     cleaned = re.sub(r"\(\s*\)", "", cleaned)
     return cleaned.strip()
+
+
+_ANY_BOOK_CITATION = re.compile(r"\s?[\[(][^\[\]()]{2,80},\s*(?:Page|p\.)\s*\d+[\])]", re.IGNORECASE)
+
+
+def strip_all_citations(text: str) -> str:
+    """Remove any [Book, Page N] references (used on the uncited AI supplement)."""
+    return _ANY_BOOK_CITATION.sub("", text or "").strip()
 
 
 def validate_generation(
@@ -77,46 +108,45 @@ def validate_generation(
         "figures": [],
     }
 
-    # Map retrieved chunks to easily matching structures
     valid_citations = set()
     for chunk in retrieved_chunks:
-        # Match by normalized title + page number safely
         book_title = chunk.book.title if chunk.book else "Unknown Textbook"
-        title_norm = book_title.strip().lower()
-        valid_citations.add((title_norm, chunk.page_number))
+        valid_citations.add((book_title.strip().lower(), chunk.page_number))
 
-    # Map retrieved figures
     valid_figure_ids = {fig["id"] for fig in retrieved_figures}
 
     stripped_citations = []
     stripped_figures = []
 
-    # 1. Validate Citations
     raw_citations = response_json.get("citations", [])
     if isinstance(raw_citations, list):
         for cit in raw_citations:
-            title = cit.get("book_title", "")
+            if not isinstance(cit, dict):
+                continue
+            title = str(cit.get("book_title", ""))
             page = cit.get("page_number")
-
+            try:
+                page = int(page) if page is not None else None
+            except (TypeError, ValueError):
+                page = None
+            cit["page_number"] = page
             if (title.strip().lower(), page) in valid_citations:
                 validated["citations"].append(cit)
             else:
                 logger.warning(f"Stripping fabricated/invalid citation: {title}, Page {page}")
                 stripped_citations.append(cit)
 
-    # 2. Validate Figures
     raw_figures = response_json.get("figures", [])
     if isinstance(raw_figures, list):
         for fig in raw_figures:
-            fig_id = fig.get("id")
-
-            if fig_id in valid_figure_ids:
+            if not isinstance(fig, dict):
+                continue
+            if fig.get("id") in valid_figure_ids:
                 validated["figures"].append(fig)
             else:
-                logger.warning(f"Stripping fabricated/invalid figure citation: Figure ID {fig_id}")
+                logger.warning(f"Stripping fabricated/invalid figure citation: Figure ID {fig.get('id')}")
                 stripped_figures.append(fig)
 
-    # 3. Clean up references in markdown text
     if stripped_citations or stripped_figures:
         validated["answer_markdown"] = clean_text_references(
             validated["answer_markdown"], stripped_citations, stripped_figures
@@ -125,261 +155,245 @@ def validate_generation(
     return validated
 
 
-def generate_answer(
-    session: Session, 
-    query: str, 
-    confidence_threshold: float = 0.55, 
-    history: list[dict[str, str]] | None = None,
-    book_id: int | None = None,
-    chapter: str | None = None
-) -> dict[str, Any]:
-    """Retrieves relevant textbook chunks and generates a grounded response using DeepSeek.
-
-    Validates citations and figures server-side to guarantee zero hallucinations.
-    Optionally scopes retrieval to a single book and/or chapter.
-    """
-    # 1. Check Retrieval Confidence (Proposal 2)
-    query_emb = retrieval_service._embed_query(query)
-    vector_results = retrieval_service.vector_search(session, query_emb, limit=10, book_id=book_id, chapter=chapter)
-    keyword_results = retrieval_service.keyword_search(session, query, limit=10, book_id=book_id, chapter=chapter)
-
-    confidence = retrieval_service.calculate_confidence(vector_results, keyword_results)
-    
-    # 2. Hybrid Retrieval
-    chunks = retrieval_service.hybrid_search(session, query, limit=5, book_id=book_id, chapter=chapter)
-
-    has_medical_context = (confidence >= confidence_threshold) and bool(chunks)
-    if not has_medical_context:
-        logger.info(f"Retrieval confidence low ({confidence:.4f}) or no chunks found for query '{query}'. Empty context will be passed.")
-        chunks = [] # Clear any weak matches so LLM doesn't hallucinate
-
-    # 3. Fetch Linked Figures
-    figures_map = retrieval_service.retrieve_figures_for_chunks(session, chunks)
-    all_figures = []
-    seen_figure_ids = set()
-
-    for chunk_figs in figures_map.values():
-        for fig in chunk_figs:
-            if fig["id"] not in seen_figure_ids:
-                all_figures.append(fig)
-                seen_figure_ids.add(fig["id"])
-
-    # 4. Formulate Context strings
-    context_chunks = []
+def _format_context(chunks: list) -> str:
+    blocks = []
     for idx, c in enumerate(chunks, 1):
         book_title = c.book.title if c.book else "Unknown Textbook"
-        context_chunks.append(
+        blocks.append(
             f"Chunk {idx}:\n"
             f"  Source Book: {book_title}\n"
             f"  Page: {c.page_number}\n"
             f"  Chapter: {c.chapter or 'N/A'}\n"
             f"  Text Content: {c.content}\n"
         )
-    formatted_context = "\n---\n".join(context_chunks) if context_chunks else "NO MEDICAL CONTEXT FOUND FOR THIS QUERY."
+    return "\n---\n".join(blocks) if blocks else "NO TEXTBOOK PASSAGES WERE RETRIEVED FOR THIS QUERY."
 
-    formatted_figures = []
-    for fig in all_figures:
-        formatted_figures.append(
-            f"Figure ID: {fig['id']}\n"
-            f"  Label: {fig['figure_label']}\n"
-            f"  Page: {fig['page_number']}\n"
-            f"  Description: {fig['caption'] or 'Image extracted (no description available)'}\n"
-        )
-    formatted_figs_str = "\n---\n".join(formatted_figures) if formatted_figures else "No figures available."
 
-    # 4b. Fetch loaded books list
-    all_books = session.query(Book).all()
-    book_titles = [b.title for b in all_books]
-    books_str = ", ".join(book_titles) if book_titles else "No books currently loaded."
+def _collect_figures(session: Session, chunks: list) -> list[dict]:
+    figures_map = retrieval_service.retrieve_figures_for_chunks(session, chunks)
+    all_figures, seen = [], set()
+    for chunk_figs in figures_map.values():
+        for fig in chunk_figs:
+            if fig["id"] not in seen:
+                all_figures.append(fig)
+                seen.add(fig["id"])
+    return all_figures
 
-    # 5. Build DeepSeek System Prompt
+
+def _format_figures(figures: list[dict]) -> str:
+    lines = [
+        f"Figure ID: {fig['id']}\n"
+        f"  Label: {fig['figure_label']}\n"
+        f"  Page: {fig['page_number']}\n"
+        f"  Description: {fig['caption'] or 'Image extracted (no description available)'}\n"
+        for fig in figures
+    ]
+    return "\n---\n".join(lines) if lines else "No figures available."
+
+
+def compose_answer_markdown(textbook_md: str, supplement_md: str) -> str:
+    parts = []
+    if textbook_md.strip():
+        parts.append(textbook_md.strip())
+    if supplement_md.strip():
+        parts.append(f"{SUPPLEMENT_HEADING}\n\n{supplement_md.strip()}")
+    return "\n\n".join(parts)
+
+
+def _grounding(textbook_md: str, supplement_md: str, citations: list, model_value: str | None) -> str:
+    has_book = bool(textbook_md.strip()) and bool(citations)
+    has_ai = bool(supplement_md.strip())
+    if has_book and has_ai:
+        return "partial"
+    if has_book:
+        return "textbook"
+    if has_ai:
+        return "ai_only"
+    # Uncited text only: conversational replies are 'none', medical ones are AI knowledge.
+    return "none" if model_value == "none" else "ai_only"
+
+
+def generate_answer(
+    session: Session,
+    query: str,
+    confidence_threshold: float = 0.55,  # accepted for API compatibility; no longer gates retrieval
+    history: list[dict[str, str]] | None = None,
+    book_id: int | None = None,
+    chapter: str | None = None,
+    level: str | None = None,
+    on_stage=None,
+) -> dict[str, Any]:
+    """Retrieve textbook context and generate a books-first answer with a labelled AI supplement.
+
+    on_stage(name) is called as the pipeline advances ("searching", "generating")
+    so a streaming endpoint can report progress.
+    """
+    def stage(name: str) -> None:
+        if on_stage:
+            try:
+                on_stage(name)
+            except Exception:
+                pass
+
+    stage("searching")
+    # Use the previous user question to disambiguate follow-ups ("and in adults?") in the rewrite.
+    prev_user = next((t["content"] for t in reversed(history or []) if t.get("role") == "user"), "")
+    result = retrieval_service.search(session, query, limit=5, book_id=book_id, chapter=chapter,
+                                      context_hint=prev_user[:300])
+    chunks = result.context
+    all_figures = _collect_figures(session, chunks)
+
+    books_str = ", ".join(b.title for b in session.query(Book).all()) or "No books currently loaded."
+    level_line = LEVEL_GUIDANCE.get((level or "").lower(), DEFAULT_LEVEL_GUIDANCE)
+
     system_prompt = (
-        "You are Dr. MedNama, an expert medical AI assistant. Your task is to answer the user's question.\n\n"
+        "You are Dr. MedNama, an expert medical tutor for MBBS and FCPS (CPSP) exam preparation.\n"
+        f"{level_line}\n\n"
         "BOOKS AVAILABLE IN SYSTEM:\n"
         f"{books_str}\n\n"
-        "GROUNDING RULES:\n"
-        "1. Answer MEDICAL questions strictly based on the facts provided in the RETRIEVED TEXT CONTEXT. "
-        "If the user asks a medical question and the context says 'NO MEDICAL CONTEXT FOUND' or the answer cannot be found in the context, "
-        "you MUST return this EXACT fallback answer: 'I am sorry, but the answer to your question is not covered in the provided textbooks.'\n"
-        "2. If the user asks a CONVERSATIONAL query (e.g. 'hi', 'how are you') or asks about the SYSTEM or BOOKS (e.g. 'how many books do you have', 'what topics can I prepare for'), "
-        "you may answer naturally and helpfully as Dr. MedNama. Do NOT proactively list all the books you have access to unless the user explicitly asks for them. Do NOT hallucinate medical facts.\n"
-        "3. For medical answers, do not invent any facts, book titles, page numbers, or figure descriptions.\n"
-        "4. Every medical assertion must be cited inline by referencing the exact book title and page number, e.g. [Microbiology Sample, Page 8].\n"
-        "5. If a diagram figure from the provided figures list is directly relevant, describe it briefly and "
-        "refer to it using its label (e.g. [Figure 2]) and associate it in the 'figures' JSON key.\n\n"
-        "You must respond in valid JSON format only, matching this structure:\n"
+        "HOW TO ANSWER MEDICAL QUESTIONS (books first, then clearly labelled AI knowledge):\n"
+        "1. textbook_answer_markdown: answer from the RETRIEVED TEXT CONTEXT. Use everything relevant, "
+        "including reasonable clinical inference from what the passages state (for example, if a passage "
+        "gives the resuscitation regimen, that IS the fluid of choice; if it explains a mechanism, that answers "
+        "the 'why'). Cite every textbook fact inline with the exact book title and page, e.g. "
+        "[Bailey Surgery, Page 280]. Leave this empty only if the passages are unrelated to the question.\n"
+        "2. supplementary_markdown: add what an exam candidate needs that the passages do NOT state: current "
+        "terms, updated guidelines, exam pearls, classic MCQ traps, or the whole answer if the passages are "
+        "unrelated. Use your own reliable medical knowledge. NEVER put book titles or page numbers here. "
+        "Keep it short; leave it empty if the textbook part already fully answers the question.\n"
+        "3. Never invent book titles, page numbers, figures or quotes. If you are genuinely unsure of a fact, "
+        "say so instead of guessing.\n"
+        "4. For CONVERSATIONAL or SYSTEM questions (greetings, 'which books do you have'), answer naturally in "
+        "textbook_answer_markdown with no citations and set grounding to 'none'. Do not list the books unless asked.\n"
+        "5. If a figure from RETRIEVED DIAGRAMS is directly relevant, refer to it by label (e.g. [Figure 2]) "
+        "and add it to 'figures'.\n\n"
+        "Respond in valid JSON only, matching this structure:\n"
         "{\n"
-        "  \"answer_markdown\": \"Your answer text...\",\n"
-        "  \"citations\": [\n"
-        "    {\n"
-        "      \"book_title\": \"exact book title matching the context\",\n"
-        "      \"page_number\": page_number_as_integer,\n"
-        "      \"excerpt\": \"exact sentence or key phrase matching the context\"\n"
-        "    }\n"
+        '  "textbook_answer_markdown": "Cited answer from the passages...",\n'
+        '  "supplementary_markdown": "Uncited AI knowledge beyond the passages, or empty string",\n'
+        '  "grounding": "textbook | partial | ai_only | none",\n'
+        '  "citations": [\n'
+        '    {"book_title": "exact book title from the context", "page_number": 123, '
+        '"excerpt": "exact sentence or key phrase from the context"}\n'
         "  ],\n"
-        "  \"figures\": [\n"
-        "    {\n"
-        "      \"id\": figure_id_as_integer,\n"
-        "      \"figure_label\": \"Figure X\",\n"
-        "      \"reason_to_include\": \"Why this figure is relevant to the answer\"\n"
-        "    }\n"
+        '  "figures": [\n'
+        '    {"id": 1, "figure_label": "Figure X", "reason_to_include": "why it is relevant"}\n'
         "  ]\n"
         "}"
     )
 
     user_content = (
         f"USER QUESTION: {query}\n\n"
-        f"RETRIEVED TEXT CONTEXT:\n{formatted_context}\n\n"
-        f"RETRIEVED DIAGRAMS:\n{formatted_figs_str}"
+        f"RETRIEVED TEXT CONTEXT:\n{_format_context(chunks)}\n\n"
+        f"RETRIEVED DIAGRAMS:\n{_format_figures(all_figures)}"
     )
 
-    # 6. Call DeepSeek API
-    has_api_key = bool(settings.deepseek_api_key and settings.deepseek_api_key.strip())
-    if not has_api_key:
-        logger.error("DEEPSEEK_API_KEY is not configured. Cannot generate answer.")
-        return NOT_COVERED_RESPONSE
+    stage("generating")
+    api_messages = [{"role": "system", "content": system_prompt}]
+    for turn in history or []:
+        # Replaying earlier refusals/errors teaches the model to refuse again.
+        if turn.get("role") == "assistant" and is_refusal_text(turn.get("content", "")):
+            continue
+        api_messages.append(turn)
+    api_messages.append({"role": "user", "content": user_content})
 
     try:
-        client = OpenAI(api_key=settings.deepseek_api_key, base_url=settings.deepseek_base_url)
-        logger.info(f"Calling DeepSeek API ({settings.deepseek_model})...")
-
-        api_messages = [{"role": "system", "content": system_prompt}]
-        if history:
-            for turn in history:
-                api_messages.append(turn)
-        api_messages.append({"role": "user", "content": user_content})
-
-        response = client.chat.completions.create(
-            model=settings.deepseek_model,
-            messages=api_messages,
-            response_format={"type": "json_object"},
-            temperature=0.0,  # Minimize creativity to enforce grounding
-        )
-
-        raw_response = response.choices[0].message.content
-        response_json = json.loads(raw_response)
-
-        # 7. Validate Citations & Figures
-        validated_json = validate_generation(response_json, chunks, all_figures)
-
-        # 8. Attach the pre-merge reranked candidates for the "matched sources" panel
-        sources = retrieval_service.candidate_search(session, query, limit=8, book_id=book_id, chapter=chapter)
-        validated_json["sources"] = sources
-        return validated_json
-
+        raw = chat_completion(api_messages, json_mode=True, temperature=0.0, max_tokens=2500, label="chat")
+        response_json = json.loads(raw)
+    except LLMNotConfigured as e:
+        logger.error(str(e))
+        return {
+            "answer_markdown": "The AI service is not configured on the server (DEEPSEEK_API_KEY is missing).",
+            "citations": [], "figures": [], "sources": result.sources,
+            "grounding": "none", "status": "not_configured",
+        }
     except Exception as e:
-        logger.error(f"Error during answer generation/validation: {e}")
-        return NOT_COVERED_RESPONSE
+        logger.error(f"Answer generation failed for {query!r}: {type(e).__name__}: {e}")
+        return {
+            "answer_markdown": (
+                "The AI service did not respond in time or returned an error, so no answer was generated. "
+                "Please try again. The closest textbook passages are listed under the sources below."
+            ),
+            "citations": [], "figures": [], "sources": result.sources,
+            "grounding": "none", "status": "llm_error",
+        }
+
+    textbook_md = str(response_json.get("textbook_answer_markdown") or response_json.get("answer_markdown") or "")
+    supplement_md = strip_all_citations(str(response_json.get("supplementary_markdown") or ""))
+
+    validated = validate_generation(
+        {"answer_markdown": textbook_md, "citations": response_json.get("citations", []),
+         "figures": response_json.get("figures", [])},
+        chunks, all_figures,
+    )
+    textbook_md = validated["answer_markdown"]
+    grounding = _grounding(textbook_md, supplement_md, validated["citations"], response_json.get("grounding"))
+
+    logger.info(
+        "answer %r: grounding=%s citations=%d top_rerank=%s",
+        query, grounding, len(validated["citations"]),
+        f"{result.top_score:.2f}" if result.top_score is not None else "n/a",
+    )
+    return {
+        "answer_markdown": compose_answer_markdown(textbook_md, supplement_md),
+        "textbook_answer_markdown": textbook_md,
+        "supplementary_markdown": supplement_md,
+        "grounding": grounding,
+        "status": "ok",
+        "citations": validated["citations"],
+        "figures": validated["figures"],
+        "sources": result.sources,
+    }
 
 
 def generate_mcq_explanation(session: Session, mcq) -> dict:
     """Generates a grounded explanation for a specific MCQ using RAG and DeepSeek."""
-    # 1. Retrieve context using hybrid search on the question text
-    query = mcq.question_text
-    chunks = retrieval_service.hybrid_search(session, query, limit=5)
-    
-    # 2. Fetch linked figures
-    figures_map = retrieval_service.retrieve_figures_for_chunks(session, chunks)
-    all_figures = []
-    seen_figure_ids = set()
-    for chunk_figs in figures_map.values():
-        for fig in chunk_figs:
-            if fig["id"] not in seen_figure_ids:
-                all_figures.append(fig)
-                seen_figure_ids.add(fig["id"])
+    options = mcq.options or {}
+    correct_text = options.get(mcq.correct_option, "")
+    query = f"{mcq.question_text} {correct_text}".strip()
+    chunks = retrieval_service.search(session, query, limit=5).context
+    all_figures = _collect_figures(session, chunks)
+    options_str = "\n".join(f"- Option {k}: {v}" for k, v in options.items())
 
-    # 3. Formulate Context strings
-    context_chunks = []
-    for idx, c in enumerate(chunks, 1):
-        book_title = c.book.title if c.book else "Unknown Textbook"
-        context_chunks.append(
-            f"Chunk {idx}:\n"
-            f"  Source Book: {book_title}\n"
-            f"  Page: {c.page_number}\n"
-            f"  Chapter: {c.chapter or 'N/A'}\n"
-            f"  Text Content: {c.content}\n"
-        )
-    formatted_context = "\n---\n".join(context_chunks)
-
-    formatted_figures = []
-    for fig in all_figures:
-        formatted_figures.append(
-            f"Figure ID: {fig['id']}\n"
-            f"  Label: {fig['figure_label']}\n"
-            f"  Page: {fig['page_number']}\n"
-            f"  Description: {fig['caption'] or 'Image extracted (no description available)'}\n"
-        )
-    formatted_figs_str = "\n---\n".join(formatted_figures) if formatted_figures else "No figures available."
-
-    # 4. Formulate System Prompt for MCQ explanation
-    options_str = "\n".join([f"- Option {k}: {v}" for k, v in mcq.options.items()])
-    
     system_prompt = (
-        "You are an expert medical AI assistant. Your task is to write a detailed, professional explanation for a multiple-choice question (MCQ) "
-        "based ONLY on the provided textbook context and figures. Do not use outside medical knowledge.\n\n"
+        "You are an expert medical tutor writing an explanation for a multiple-choice question (MCQ) "
+        "for MBBS/FCPS exam preparation.\n\n"
         "EXPLANATION RULES:\n"
-        "1. Confirm why the correct option is indeed correct, quoting facts from the text.\n"
-        "2. Address the other options and explain why they are incorrect or less appropriate based on the context.\n"
-        "3. Every assertion must be cited inline by referencing the exact book title and page number, e.g. [Microbiology Sample, Page 8].\n"
-        "4. If a diagram figure from the provided figures list is directly relevant, refer to it using its label (e.g. [Figure 2]) and associate it in the 'figures' JSON key.\n\n"
-        "You must respond in valid JSON format only, matching this structure:\n"
+        "1. Explain why the correct option is correct and why each other option is wrong.\n"
+        "2. Prefer facts from the RETRIEVED TEXTBOOK CONTEXT and cite them inline with the exact book title "
+        "and page, e.g. [Bailey Surgery, Page 280].\n"
+        "3. Where the context does not cover a point, you may use reliable medical knowledge, but mark that "
+        "sentence with '(AI knowledge)' and do not attach a book or page to it.\n"
+        "4. If a figure from the provided list is directly relevant, refer to it by label and add it to 'figures'.\n\n"
+        "Respond in valid JSON only:\n"
         "{\n"
-        "  \"answer_markdown\": \"Your structured explanation here...\",\n"
-        "  \"citations\": [\n"
-        "    {\n"
-        "      \"book_title\": \"exact book title matching the context\",\n"
-        "      \"page_number\": page_number_as_integer,\n"
-        "      \"excerpt\": \"exact sentence or key phrase matching the context\"\n"
-        "    }\n"
-        "  ],\n"
-        "  \"figures\": [\n"
-        "    {\n"
-        "      \"id\": figure_id_as_integer,\n"
-        "      \"figure_label\": \"Figure X\",\n"
-        "      \"reason_to_include\": \"Why this figure is relevant to the explanation\"\n"
-        "    }\n"
-        "  ]\n"
+        '  "answer_markdown": "Your structured explanation...",\n'
+        '  "citations": [{"book_title": "exact title", "page_number": 123, "excerpt": "key phrase"}],\n'
+        '  "figures": [{"id": 1, "figure_label": "Figure X", "reason_to_include": "why"}]\n'
         "}"
     )
-
     user_content = (
         f"QUESTION: {mcq.question_text}\n"
         f"OPTIONS:\n{options_str}\n"
         f"CORRECT OPTION: {mcq.correct_option}\n\n"
-        f"RETRIEVED TEXTBOOK CONTEXT:\n{formatted_context}\n\n"
-        f"RETRIEVED DIAGRAMS:\n{formatted_figs_str}"
+        f"RETRIEVED TEXTBOOK CONTEXT:\n{_format_context(chunks)}\n\n"
+        f"RETRIEVED DIAGRAMS:\n{_format_figures(all_figures)}"
     )
 
-    # 5. Call DeepSeek API
-    has_api_key = bool(settings.deepseek_api_key and settings.deepseek_api_key.strip())
-    if not has_api_key:
+    try:
+        raw = chat_completion(
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}],
+            json_mode=True, temperature=0.0, max_tokens=2000, label="mcq-explain",
+        )
+        return validate_generation(json.loads(raw), chunks, all_figures)
+    except LLMNotConfigured:
         return {
             "answer_markdown": f"Explanation cannot be generated: DEEPSEEK_API_KEY is not configured.\n\nCorrect Option was: **{mcq.correct_option}**",
-            "citations": [],
-            "figures": []
+            "citations": [], "figures": [],
         }
-
-    try:
-        client = OpenAI(api_key=settings.deepseek_api_key, base_url=settings.deepseek_base_url)
-        logger.info(f"Calling DeepSeek API for MCQ {mcq.id} explanation...")
-        response = client.chat.completions.create(
-            model=settings.deepseek_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.0,
-        )
-        response_json = json.loads(response.choices[0].message.content)
-        
-        # Validate citations
-        validated = validate_generation(response_json, chunks, all_figures)
-        return validated
     except Exception as e:
         logger.error(f"Error generating MCQ explanation: {e}")
         return {
             "answer_markdown": f"Failed to generate explanation due to an internal error.\n\nCorrect Option was: **{mcq.correct_option}**",
-            "citations": [],
-            "figures": []
+            "citations": [], "figures": [],
         }

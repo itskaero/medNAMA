@@ -1,6 +1,6 @@
 # medNAMA: reliability, grounding and FCPS readiness plan
 
-One plan covering the problems reported so far, why each happens, and the fixes in order. This is an investigation and proposal. No application code has been changed.
+One plan covering the problems reported so far, why each happens, and the fixes in order. Sections 1–6 are the original proposal. **Section 0 records what measurement on the real database actually showed (it corrects some of the original guesses), and section 7 records what has been implemented.**
 
 **Problems reported**
 1. "Fluid of choice in hypertrophic pyloric stenosis" returned *"not covered in the provided textbooks"*, although Bailey & Love is ingested.
@@ -8,9 +8,46 @@ One plan covering the problems reported so far, why each happens, and the fixes 
 3. CPSP/FCPS questions use current terms and concepts (for example "paradoxical aciduria" in HPS) that a textbook edition may not state. A "books only, otherwise refuse" design fails these questions.
 4. MCQ generation is not aware of the database, so it can keep generating the same questions again.
 
-**Ingested books:** Bailey & Love, Davidson, Dhingra ENT, Levinson Microbiology, Snell Anatomy, Katzung Pharmacology, Guyton & Hall Physiology, Robbins Pathology, Ramadas Pathology.
+**Ingested books:** Bailey & Love, Davidson, Dhingra ENT, Levinson Microbiology, Snell Anatomy, Katzung Pharmacology, Guyton & Hall Physiology, Robbins Pathology, Ramadas Pathology, plus First Aid 2024 and a partial Nelson Ed22 Vol 1 (722 chunks; its ingestion looks incomplete).
 
 **Model:** DeepSeek `deepseek-v4-flash` through the OpenAI-compatible client.
+
+---
+
+## 0. What measurement showed (2026-09-24, local dev DB, 11 books, ~105k child chunks)
+
+Measured with `scripts/run_diagnosis.py` (16 mixed-subject questions) and direct probes of `generate_answer`.
+
+**The confidence gate was NOT the cause.** All 16 questions scored 0.62–0.78 and passed the 0.55 gate. The gate separated nothing, so it has been removed as a filter.
+
+**Why "fluid of choice in HPS" was refused:**
+- The answer is in Bailey & Love p.280 (chunk 162653): *"0.9% saline with 0.15% KCl in 5% glucose given at 6–7.5 mL/kg/h … As the chloride deficit is replaced, the kidneys correct the pH."* That is the same sentence the MCQ explanation quoted.
+- Vector search ranked it **#7**, but the ms-marco re-ranker scored it **−5.9** against the exam wording, so it fell out of the top 5 and DeepSeek never saw it. DeepSeek then correctly said the passages it had didn't contain the answer.
+- Rewriting the question into textbook terms lifts it to vector **#2**, re-rank **−0.56**.
+- Parent "chunks" are single paragraphs (median **294 chars**). The paragraph that matched ("Pyloric stenosis presents with…") sits two paragraphs above the one holding the answer, so even a correct hit missed the answer.
+
+**Why "paradoxical aciduria" was refused in chat:**
+- Asked fresh, it *was* answered correctly (Davidson p.821, re-rank 7.17).
+- The refusal came from asking it in a conversation after the HPS refusal: earlier "not covered" replies were replayed to the model as history.
+
+**Why the MCQ explanation could mention it:** MCQ generation retrieved on the topic ("pyloric stenosis"), which matches the p.280 passage strongly. It had no refusal rule, and it never validated its sources.
+
+**Other defects found:**
+
+| Finding | Evidence |
+|---|---|
+| Bailey & Love lost its fi/fl/ff ligatures | ~2,600 passages; "fluid" is stored as "fuid" (×596), "first" as "frst" (×664). 612 damaged spellings in all. Keyword search for these words never matched. |
+| Keyword search returned 0 hits for 7/16 questions | `websearch_to_tsquery` ANDs every word. The abbreviation expansion made it *stricter* (appended words were also ANDed). |
+| No indexes on `chunks` | Every keyword query was a full scan computing `to_tsvector` on 105k rows: **2.3 s**. With a GIN index: **0.15 ms**. |
+| `deepseek-v4-flash` reasons ("thinks") by default | A short call took 1.5 s and returned *empty* text, because reasoning used the whole token budget. With thinking disabled: 0.6 s. |
+| `generate_ai_quiz` used an undefined `logger` | Any DeepSeek error in a batch became `NameError`, returned as "Internal Server Error: name 'logger' is not defined". |
+| Next.js proxy timeout | Confirmed in `next/dist/server/lib/router-utils/proxy-request.js`: `proxyTimeout \|\| 30000`. |
+| MCQ source attribution unverified | A generated fluid-regimen question was credited to First Aid p.387, which never mentions saline, dextrose or KCl. |
+
+**So, is AI + RAG "too strict" or "wired wrong"? Both, in specific ways:**
+- **Wired wrong:** exam wording wasn't translated into textbook wording, the context unit was too small, keyword search could only match all-or-nothing, and there were no indexes.
+- **Too strict:** the prompt forced a refusal unless the passage stated the answer in the question's own words, and old refusals were replayed.
+- MCQ generation had neither problem (and no checks at all), which is why the two features disagreed.
 
 ---
 
@@ -189,3 +226,64 @@ The books were added for **trust, MCQ content and level setting** (undergraduate
 - **Repetition:**
   - Generate 3 sets of 10 on "pyloric stenosis".
   - Expect 0 pairs with stem cosine > 0.90, and more distinct `tested_concept` values and source chunk IDs across the sets than today.
+
+---
+
+## 7. Implementation status (2026-09-24)
+
+| Plan item | Status | Where |
+|---|---|---|
+| Phase 0: `diagnose_query.py` `NameError` | Done | `scripts/diagnose_query.py` |
+| 1.1 Proxy timeout 180 s | Done | `docker/frontend.Dockerfile`, `NAS/frontend.Dockerfile` |
+| 1.2 Retry only fast (< 2.5 s) failures | Done | `frontend/src/lib/proxyFetch.ts` |
+| 1.3 Idempotency key | Done: `request_id` becomes the quiz set id; a repeat returns, or waits for, the first run | `app/quiz_generation.py` |
+| 1.4 Recover a set after a client timeout | Done: polls `GET /api/chat/ai-quizzes/{id}` | `QuizView.tsx`, `main.py` |
+| 1.5 DeepSeek timeout/retries, thinking off | Done: shared client, 60 s, 1 retry; `LLM_THINKING=false` by default | `app/llm.py`, `config.py` |
+| 1.6 Partial-success MCQs, JSON 502/504 | Done | `app/quiz_generation.py` |
+| 1.7 Backend logging | Done: `LOG_LEVEL`; logs search context, rerank score, DeepSeek latency, grounding | `main.py` |
+| Missing `logger` in `main.py` (real 500 source) | Fixed | `main.py` |
+| 2.1 Parallel MCQ batches | Done (up to 4 at once, plus one top-up round) | `app/quiz_generation.py` |
+| 2.2 One retrieval pass per chat question | Done (`search()` returns context + sources) | `app/retrieval.py`, `generation.py` |
+| 2.3 Streaming chat | Done: `POST /api/chat/query/stream` (SSE). Progress events + a heartbeat every 3 s, so the connection is never idle; the UI shows the real stage | `main.py`, `useChat.ts` |
+| 2.3 MCQ background jobs | Done: `POST /api/chat/generate-ai-quiz/jobs` returns at once; UI polls `GET …/jobs/{id}`. Idempotent on `request_id` | `quiz_generation.py`, `QuizView.tsx` |
+| 3.1 Drop the vector-score gate | Done; unrelated passages are dropped by rerank score < −7 instead | `retrieval.py` |
+| 3.2 Keyword OR fallback, strip exam phrasing | Done | `retrieval.py::keyword_search` |
+| 3.3 UK/US + lost-ligature variants | Done at query time | `retrieval.py` |
+| 3.4 More abbreviations | Done (~30) | `MEDICAL_SYNONYMS` |
+| 3.5 LLM query rewrite | Done (≈1 s, cached, `QUERY_REWRITE=false` to disable) | `retrieval.py::rewrite_query` |
+| New: neighbour-paragraph context expansion | Done (±3 paragraphs on the same page, ≤ 3,000 chars) | `retrieval.py::expand_context` |
+| New: rerank on the matched part of long chunks; skip index pages | Done | `retrieval.py` |
+| New: DB indexes (GIN full-text, parent_id, book/page) | Done (migration `b7d2e4f6a8c1`) | `alembic/versions/` |
+| New: repair Bailey's ligatures in the data | Applied after a full backup (`medrag-pre-ligature-repair-20260924.dump`): 612 spellings, 8,108 child chunks re-embedded | `scripts/repair_ligatures.py` |
+| 3.6 Medical re-ranker | Done, by measurement (`scripts/eval_rerankers.py`, 12 questions with known answer passages): ms-marco MRR 0.815 (hit@1 9/12); MedCPT alone 0.840 but ~5× slower; **two-stage ms-marco → MedCPT on the top 8: MRR 0.885 (hit@1 10/12)**, adopted. `RERANKER_SECOND_STAGE=""` disables it on a slow NAS | `retrieval.py`, `config.py` |
+| 3.6 Re-embed children without the metadata prefix | Not done, deliberately: vector scores were not the bottleneck (all 16 test questions score 0.62–0.78), and re-embedding ~105k chunks on CPU takes hours | |
+| 4.1 Two-part answer + `grounding` + `status` | Done; `answer_markdown` stays for existing screens | `generation.py` |
+| 4.2 Don't replay refusals in history | Done | `generation.py` |
+| 4.3 User level | Done: chat selector (General / MBBS / FCPS-I / FCPS-II), remembered per browser | `ChatView.tsx`, `page.tsx` |
+| 4.4 Grounding badge | Done | `AIMessage.tsx` |
+| 4.4 "Report wrong answer" | Done: Report on chat answers and MCQ explanations; admin review queue on the dashboard (resolve / dismiss / reopen) | `answer_reports` (migration `c9e3a5b7d2f4`), `ReportButton.tsx`, `ReportsPanel.tsx` |
+| 5.1 MCQ stem embeddings (+ lazy backfill) | Done | `mcqs.stem_embedding` |
+| 5.2 "Already asked" = 40 most similar existing MCQs | Done | `quiz_generation.py` |
+| 5.3 Semantic duplicate check | Done (stem cosine > 0.90, or > 0.80 with the same answer) | |
+| 5.4 Source-passage rotation | Done (`source_chunk_ids`, down-ranked on the next set) | |
+| 5.5 Per-user "unseen first" drills | Done: practice quizzes put never-attempted questions first (`prefer_unseen`, default on) | `start_quiz_endpoint` |
+| 5.6 `tested_concept` tags | Done | |
+| New: verify MCQ source actually states the answer | Done (else labelled AI knowledge, no page) | `quiz_generation.py::_answer_supported` |
+| FCPS profile (A–E) | Done, default; USMLE A–D selectable | `QuizView.tsx`, `PROFILES` |
+| New: batch angles + concept-level de-dup | Done: parallel batches cover different angles; the same fact reworded is rejected (concept cosine > 0.88) | `quiz_generation.py` |
+| 6: FCPS mock paper | Done: one-click preset, 50 questions / 60 min / all subjects / board mode / unseen first | `QuizView.tsx` |
+| 6: Wrong answers → flashcards | Done: "Make flashcard" on missed questions in quiz review | `QuizView.tsx` |
+| 6: Books to add | Your action: Paediatrics (finish Nelson ingestion), Gynae/Obs, Biochemistry, an FCPS review book | |
+
+**Measured after the changes** (local, models already loaded):
+- **Chat:** "fluid of choice in HPS" is answered and cites Bailey p.280 (0.9% saline + 0.15% KCl in 5% glucose). "Paradoxical aciduria" cites Bailey p.1190 and Davidson p.821 and p.385. Both are labelled "Partly textbook-backed". Answers take about 7–12 s.
+- **Search suite:** 16/16 questions get textbook context. Keyword hits are ≥ 3 for every question (7 had 0 before).
+- **MCQs:** 10 FCPS questions take 2 parallel batches of about 5–6 s each. 3 repeats of earlier HPS questions were rejected, the next set used different passages, and a retry with the same `request_id` returned in 0.0 s.
+
+**Measured at the end (local Docker stack, through the Next.js proxy on :3000, CPU idle):**
+- **Streamed chat:** first byte in 0.01–0.11 s, a heartbeat every 3 s, and a full answer in 9–18 s. About 5.5 s of that is DeepSeek (thinking off); the rest is search.
+  - 8/8 test questions were answered, including one-line ones ("define shock", "what is anemia", "causes of jaundice", "DOC for absence seizure"), with citations.
+  - "Fluid of choice in HPS" cites Bailey p.280, which is now the top context after the ligature repair and the two-stage re-ranker.
+- **MCQ jobs:** the start request returns in 0.09 s. 10 FCPS questions were ready in ~25 s (9 with a cited book and page, 1 labelled AI knowledge). A repeated `request_id` returns the same job.
+- **Retrieval suite:** 16/16 questions get textbook context.
+- **Reports:** create, list, dismiss and reopen verified end to end.

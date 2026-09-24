@@ -29,7 +29,7 @@ def main() -> None:
 
     for query in args.queries:
         print(f"{QUERY_MARKER}{query}", flush=True)
-        diagnose(query, threshold, args.book_id)
+        diagnose(query, args.threshold, args.book_id)
 
 
 QUERY_MARKER = "### QUERY: "
@@ -46,12 +46,10 @@ def diagnose(query: str, threshold: float, book_id: int | None) -> None:
         keyword_results = retrieval_service.keyword_search(session, query, limit=10, book_id=book_id)
         confidence = retrieval_service.calculate_confidence(vector_results, keyword_results)
 
-        print("== Confidence gate ==")
+        print("== Raw retrieval (original query only) ==")
         print(f"Top vector score:  {vector_results[0][1]:.4f}" if vector_results else "Top vector score:  (none)")
         print(f"Keyword hits:      {len(keyword_results)}")
-        print(f"Confidence:        {confidence:.4f}  (threshold {threshold})")
-        verdict = "PASS - chunks sent to DeepSeek" if confidence >= threshold else "FAIL - chunks dropped, chat will refuse"
-        print(f"Gate result:       {verdict}\n")
+        print(f"Legacy confidence: {confidence:.4f}  (old 0.55 gate, no longer used by chat)\n")
 
         print("== Top vector child chunks ==")
         for chunk, score in vector_results[:5]:
@@ -61,23 +59,28 @@ def diagnose(query: str, threshold: float, book_id: int | None) -> None:
 
         print("\n== Top keyword child chunks ==")
         if not keyword_results:
-            print("  (none - every query word must appear in one chunk)")
+            print("  (none, even with the OR fallback)")
         for chunk, rank in keyword_results[:5]:
             title = chunk.book.title if chunk.book else "?"
             text = " ".join((chunk.extra_metadata or {}).get("original_text", chunk.content).split())[:160]
             print(f"  {rank:.4f}  {title} p.{chunk.page_number}: {text}")
 
-        print("\n== Reranked parent chunks (what DeepSeek would see if the gate passed) ==")
-        candidates = retrieval_service.candidate_search(session, query, limit=5, book_id=book_id)
-        for cand in candidates:
-            print(f"  #{cand['rank']} rerank={cand['relevance_score']:.3f}  {cand['book_title']} p.{cand['page_number']}")
-            print(f"      {cand['snippet'][:200]}")
+        print("\n== search(): rewrite + RRF + rerank + neighbour expansion (what DeepSeek sees) ==")
+        result = retrieval_service.search(session, query, limit=5, book_id=book_id)
+        if len(result.queries) > 1:
+            print(f"Rewritten query: {result.queries[1]!r}")
+        for block in result.context:
+            title = block.book.title if block.book else "?"
+            print(f"  rerank={block.score:6.2f}  {title} p.{block.page_number} ({len(block.content)} chars, chunks {block.chunk_ids})")
+            print(f"      {' '.join(block.content.split())[:200]}")
 
         # Machine-readable line consumed by run_diagnosis.py's summary table.
-        top = f"{candidates[0]['book_title']} p.{candidates[0]['page_number']}" if candidates else "-"
+        top = (f"{result.context[0].book.title if result.context[0].book else '?'} p.{result.context[0].page_number}"
+               if result.context else "-")
         top_vec = f"{vector_results[0][1]:.3f}" if vector_results else "-"
-        gate = "PASS" if confidence >= threshold else "FAIL"
-        print(f"\nSUMMARY|{top_vec}|{len(keyword_results)}|{confidence:.3f}|{gate}|{top}")
+        top_rerank = f"{result.top_score:.2f}" if result.top_score is not None else "-"
+        sent = "YES" if result.context else "NO"
+        print(f"\nSUMMARY|{top_vec}|{len(keyword_results)}|{top_rerank}|{sent}|{top}")
     finally:
         session.close()
 

@@ -53,6 +53,24 @@ export default function Home() {
     chapter: null,
   });
   const [chatChapters, setChatChapters] = useState<string[]>([]);
+  // Study level (answer depth). Per-browser preference; null = general exam prep.
+  const [chatLevel, setChatLevelState] = useState<string | null>(null);
+  useEffect(() => {
+    try {
+      setChatLevelState(localStorage.getItem("mednama_level"));
+    } catch {
+      /* storage unavailable */
+    }
+  }, []);
+  const setChatLevel = useCallback((level: string | null) => {
+    setChatLevelState(level);
+    try {
+      if (level) localStorage.setItem("mednama_level", level);
+      else localStorage.removeItem("mednama_level");
+    } catch {
+      /* storage unavailable */
+    }
+  }, []);
 
   // ── Refs ───────────────────────────────────────────────────────────────────
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -136,6 +154,7 @@ export default function Home() {
     messages,
     setMessages,
     scope: chatScope,
+    level: chatLevel,
   });
 
   // F2 — fetch distinct chapter headings when the user scopes chat to a book
@@ -317,6 +336,8 @@ export default function Home() {
           setActiveView={setActiveView}
           setSelectedTopic={setSelectedTopic}
           handleReviewPreviousQuiz={quiz.handleReviewPreviousQuiz}
+          isAdmin={isAdmin}
+          token={token}
         />
       );
     }
@@ -451,6 +472,8 @@ export default function Home() {
         books={books}
         scope={chatScope}
         setScope={setChatScope}
+        level={chatLevel}
+        setLevel={setChatLevel}
         chapters={chatChapters}
         fetchChapters={fetchChatChapters}
       />

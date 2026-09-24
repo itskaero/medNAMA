@@ -1,6 +1,7 @@
 "use client";
 
 import React from "react";
+import { ReportsPanel } from "@/components/ReportsPanel";
 import {
   BookOpen,
   Stethoscope,
@@ -20,6 +21,9 @@ interface DashboardViewProps {
   setActiveView: (view: any) => void;
   setSelectedTopic: (topic: any) => void;
   handleReviewPreviousQuiz: (attemptId: number) => void;
+  /** Admins see the "Reported answers" review queue. */
+  isAdmin?: boolean;
+  token?: string | null;
 }
 
 export default function DashboardView({
@@ -31,6 +35,8 @@ export default function DashboardView({
   setActiveView,
   setSelectedTopic,
   handleReviewPreviousQuiz,
+  isAdmin = false,
+  token = null,
 }: DashboardViewProps) {
   return (
     <div className="dashboard-view" role="region" aria-label="Dashboard metrics">
@@ -301,6 +307,8 @@ export default function DashboardView({
           </div>
         )}
       </div>
+
+      {isAdmin ? <ReportsPanel token={token} /> : null}
     </div>
   );
 }

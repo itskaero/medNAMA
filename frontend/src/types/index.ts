@@ -34,11 +34,20 @@ export interface RAGSource {
   relevance_score: number;
 }
 
+/** How much of an answer is backed by the ingested textbooks. */
+export type Grounding = "textbook" | "partial" | "ai_only" | "none";
+
 export interface AnswerResponse {
   answer_markdown: string;
   citations: Citation[];
   figures: Figure[];
   sources?: RAGSource[];
+  /** Cited part from the textbooks (answer_markdown = this + labelled supplement). */
+  textbook_answer_markdown?: string;
+  /** Uncited AI clinical knowledge beyond the textbooks. */
+  supplementary_markdown?: string;
+  grounding?: Grounding;
+  status?: "ok" | "llm_error" | "not_configured";
 }
 
 export interface Message {
@@ -49,6 +58,8 @@ export interface Message {
   errorMsg?: string;
   query?: string;
   timestamp?: string;
+  /** Live pipeline stage reported by the streaming chat endpoint (thinking messages). */
+  stage?: string;
 }
 
 export interface Note {

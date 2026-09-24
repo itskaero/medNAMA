@@ -324,11 +324,11 @@ export function useQuiz({
       const optionKeys = Object.keys(currentMCQ.options).sort();
 
       if (!isAnswered) {
-        if (["A", "B", "C", "D"].includes(key)) {
+        if (["A", "B", "C", "D", "E"].includes(key)) {
           if (optionKeys.includes(key)) {
             handleSelectOption(key);
           }
-        } else if (["1", "2", "3", "4"].includes(key)) {
+        } else if (["1", "2", "3", "4", "5"].includes(key)) {
           const idx = parseInt(key) - 1;
           if (idx >= 0 && idx < optionKeys.length) {
             handleSelectOption(optionKeys[idx]);

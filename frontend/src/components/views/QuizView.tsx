@@ -29,6 +29,7 @@ import {
   ArrowLeft,
   AlertTriangle,
   RotateCcw,
+  Layers,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { AnswerResponse, Figure, Book } from "@/types";
@@ -40,6 +41,14 @@ import { Switch } from "@/components/ui/switch";
 import { Slider } from "@/components/ui/slider";
 import ExplanationPanel from "@/components/ExplanationPanel";
 import BasicDropdown from "@/components/ui/basic-dropdown";
+
+// Quiz generation runs as a background job: the start request returns at once
+// and the page polls its status, so no proxy/browser timeout can cut it off.
+const QUIZ_POLL_INTERVAL_MS = 2_500;
+// FCPS-I style paper: ~1.2 min per single-best-answer question.
+const MOCK_PAPER_QUESTIONS = 50;
+const MOCK_PAPER_MINUTES = 60;
+const QUIZ_MAX_WAIT_MS = 6 * 60_000;
 
 interface QuizViewProps {
   // quiz flow
@@ -199,6 +208,7 @@ export default function QuizView({
   const [isGenerating, setIsGenerating] = React.useState(false);
   const [aiDifficulty, setAiDifficulty] = React.useState(3); // 1-5, sent to the AI quiz generator
   const [aiCount, setAiCount] = React.useState(5); // F3 — multiples of 5 only: 5/10/15/20
+  const [aiProfile, setAiProfile] = React.useState<"fcps" | "usmle">("fcps"); // FCPS = 5 options A-E
   const [quizHistory, setQuizHistory] = React.useState<AiQuizSetSummary[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = React.useState(false);
   const [historySearch, setHistorySearch] = React.useState("");
@@ -282,6 +292,66 @@ export default function QuizView({
     }
   }, [studioMessages, isGenerating, builderMode]);
 
+  // Poll a background quiz job until it finishes. Transient network errors
+  // (e.g. a proxy restart) are tolerated; only a real job failure or the overall
+  // wait cap ends it.
+  const waitForQuizJob = async (jobId: string): Promise<any> => {
+    if (!getHeaders) throw new Error("Not signed in.");
+    const started = Date.now();
+    let networkFailures = 0;
+    while (Date.now() - started < QUIZ_MAX_WAIT_MS) {
+      await new Promise((r) => setTimeout(r, QUIZ_POLL_INTERVAL_MS));
+      let res: Response;
+      try {
+        res = await fetch(`${API}/api/chat/generate-ai-quiz/jobs/${encodeURIComponent(jobId)}`, {
+          headers: getHeaders(),
+          credentials: "include",
+        });
+      } catch {
+        if (++networkFailures >= 10) throw new Error("Lost contact with the server while the quiz was generating.");
+        continue;
+      }
+      networkFailures = 0;
+      const body = (await res.json().catch(() => null)) as any;
+      if (!res.ok) {
+        if (res.status >= 500) continue; // proxy hiccup; keep polling
+        throw new Error((body && body.detail) || `Quiz status check failed (HTTP ${res.status}).`);
+      }
+      if (body?.status === "done") return body.result;
+      if (body?.status === "failed") throw new Error(body.detail || "Quiz generation failed.");
+    }
+    throw new Error(
+      "The quiz is still generating after several minutes. It will appear in Saved History when it finishes."
+    );
+  };
+
+  // Phase 6 — turn a missed question into a spaced-repetition flashcard.
+  const [flashcardSavedIds, setFlashcardSavedIds] = React.useState<number[]>([]);
+  const handleMakeFlashcard = async (mcq: any) => {
+    if (!getHeaders) return;
+    const answerText = mcq.options?.[mcq.correct_option] ?? "";
+    const explanation =
+      explanationMCQId === mcq.id && explanationData?.answer_markdown ? explanationData.answer_markdown : "";
+    const back = `**${mcq.correct_option}. ${answerText}**${explanation ? `\n\n${explanation.slice(0, 1500)}` : ""}`;
+    try {
+      const res = await fetch(`${API}/api/flashcards`, {
+        method: "POST",
+        headers: { ...getHeaders(), "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          front: mcq.question_text,
+          back,
+          topic: mcq.sub_category || mcq.main_category || "Missed MCQ",
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setFlashcardSavedIds((prev) => [...prev, mcq.id]);
+      toast.success("Saved to flashcards (Study Corner).");
+    } catch (e: any) {
+      toast.error(`Could not save flashcard: ${e.message || e}`);
+    }
+  };
+
   // Handle AI Quiz Generation inside config screen
   const handleGenerate = async (customPrompt?: string) => {
     const queryPrompt = customPrompt || promptInput;
@@ -309,8 +379,14 @@ export default function QuizView({
     setPromptInput("");
     setIsGenerating(true);
 
+    // Idempotency key: a repeated start (double click, retry) returns the same job.
+    const requestId =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
     try {
-      const res = await proxySafeFetch(`${API}/api/chat/generate-ai-quiz`, {
+      const startRes = await proxySafeFetch(`${API}/api/chat/generate-ai-quiz/jobs`, {
         method: "POST",
         headers: {
           ...getHeaders(),
@@ -322,26 +398,33 @@ export default function QuizView({
           book_id: selectedBookId === "all" ? null : selectedBookId,
           difficulty: aiDifficulty,
           count: aiCount,
+          exam_profile: aiProfile,
+          request_id: requestId,
         }),
       });
-
-      const data = (await res.json().catch(() => null)) as any;
-
-      if (!res.ok) {
-        throw new Error((data && data.detail) || `Failed to generate quiz (HTTP ${res.status}).`);
+      const started = (await startRes.json().catch(() => null)) as any;
+      if (!startRes.ok || !started?.job_id) {
+        throw new Error((started && started.detail) || `Failed to start quiz generation (HTTP ${startRes.status}).`);
       }
+
+      const data = await waitForQuizJob(started.job_id);
 
       fetchQuizHistory();
       const dupNote =
         data && typeof data.duplicates_skipped === "number" && data.duplicates_skipped > 0
-          ? `\n\n_${data.duplicates_skipped} near-duplicate${data.duplicates_skipped === 1 ? "" : "s"} were skipped to keep this set fresh._`
+          ? `\n\n_${data.duplicates_skipped} question${data.duplicates_skipped === 1 ? " was" : "s were"} skipped because they repeated existing MCQs on this topic._`
+          : "";
+      const g = data?.grounding_counts;
+      const groundingNote =
+        g && typeof g.book === "number"
+          ? `\n\n${g.book} from your textbooks (cited book & page)${g.ai ? `, ${g.ai} from AI clinical knowledge (labelled, no page)` : ""}.`
           : "";
       setStudioMessages((prev) => [
         ...prev,
         {
           id: `ai-${Date.now()}`,
           sender: "ai",
-          content: `I've generated **${data.quiz_set_title}** containing ${data.total_questions} board-style MCQs grounded directly in textbook RAG context!${dupNote}`,
+          content: `I've generated **${data.quiz_set_title}** containing ${data.total_questions} MCQs.${groundingNote}${dupNote}`,
           quizResult: data,
           timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
         },
@@ -691,6 +774,46 @@ export default function QuizView({
                   {/* Mode 1: Manual Builder */}
                   {builderMode === "manual" && (
                     <>
+                      {/* Phase 6 — one-click FCPS-style mock paper using the existing timed + board modes */}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setQuizConfigCategories([]);
+                          setQuizConfigSubCategories([]);
+                          setQuizConfigNumQuestions(Math.max(1, Math.min(MOCK_PAPER_QUESTIONS, totalSystemMCQs || MOCK_PAPER_QUESTIONS)));
+                          setQuizConfigTimerMode("session");
+                          setQuizConfigTimerValue(MOCK_PAPER_MINUTES);
+                          setQuizConfigFeedbackMode("board");
+                          setQuizConfigExcludeMastered(false);
+                          setQuizConfigStep(3);
+                          toast.success("Mock paper set up: review the settings and start.");
+                        }}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: "12px",
+                          width: "100%",
+                          padding: "12px 14px",
+                          marginBottom: "var(--sp-3)",
+                          borderRadius: "12px",
+                          border: "1px dashed var(--sky)",
+                          background: "rgba(48,197,255,0.06)",
+                          color: "var(--text-primary)",
+                          cursor: "pointer",
+                          textAlign: "left",
+                        }}
+                        title="All subjects, unseen questions first, one session timer, answers revealed at the end"
+                      >
+                        <span style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
+                          <span style={{ fontWeight: 700, fontSize: "0.86rem" }}>FCPS mock paper</span>
+                          <span style={{ fontSize: "0.72rem", color: "var(--text-secondary)" }}>
+                            {MOCK_PAPER_QUESTIONS} questions · {MOCK_PAPER_MINUTES} min · all subjects · board mode (answers at the end) · unseen first
+                          </span>
+                        </span>
+                        <Clock size={16} style={{ color: "var(--sky)", flexShrink: 0 }} />
+                      </button>
+
                       <div style={{ display: "flex", flexDirection: "column", gap: "var(--sp-2)" }}>
                         <label style={{ fontSize: "0.72rem", fontWeight: 700, color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
                           Main Categories
@@ -991,6 +1114,34 @@ export default function QuizView({
                                   }}
                                 >
                                   {num}
+                                </button>
+                              ))}
+                            </div>
+                            <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                              <span style={{ fontSize: "0.66rem", fontWeight: 700, color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.05em", marginRight: "2px" }}>
+                                Style
+                              </span>
+                              {([["fcps", "FCPS A–E", "CPSP single best answer, 5 options"], ["usmle", "USMLE A–D", "Board-style vignette, 4 options"]] as const).map(([val, label, hint]) => (
+                                <button
+                                  key={val}
+                                  type="button"
+                                  title={hint}
+                                  onClick={() => setAiProfile(val)}
+                                  style={{
+                                    height: "24px",
+                                    padding: "0 8px",
+                                    borderRadius: "6px",
+                                    border: "1px solid",
+                                    borderColor: aiProfile === val ? "var(--sky)" : "var(--border-light)",
+                                    background: aiProfile === val ? "rgba(48,197,255,0.12)" : "var(--surface-3)",
+                                    color: aiProfile === val ? "var(--sky)" : "var(--text-secondary)",
+                                    cursor: "pointer",
+                                    fontWeight: 700,
+                                    fontSize: "0.7rem",
+                                    transition: "all var(--dur-fast)",
+                                  }}
+                                >
+                                  {label}
                                 </button>
                               ))}
                             </div>
@@ -1635,6 +1786,18 @@ export default function QuizView({
                         <GraduationCap size={14} />
                         Clinical Explanation
                       </button>
+                      {quizSelectedAnswers[reviewMCQ.id] !== reviewMCQ.correct_option ? (
+                        <button
+                          className="btn-workspace"
+                          style={{ marginLeft: "8px", display: "flex", alignItems: "center", gap: "6px" }}
+                          disabled={flashcardSavedIds.includes(reviewMCQ.id)}
+                          onClick={() => handleMakeFlashcard(reviewMCQ)}
+                          title="Save this missed question to Study Corner flashcards (spaced repetition)"
+                        >
+                          <Layers size={14} />
+                          {flashcardSavedIds.includes(reviewMCQ.id) ? "Flashcard saved" : "Make flashcard"}
+                        </button>
+                      ) : null}
                     </div>
                   </div>
                 </div>

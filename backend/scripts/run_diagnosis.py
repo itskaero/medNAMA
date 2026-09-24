@@ -151,13 +151,13 @@ def build_summary(outputs: list[tuple[str, str]], threshold: float) -> str:
             gate, top = "ERROR", "see output above"
         rows.append((categories.get(q, "custom"), q[:55], vec, kw, conf, gate, top))
 
-    header = ("type", "query", "vector", "kw hits", "conf", "gate", "top reranked source")
+    header = ("type", "query", "vector", "kw hits", "rerank", "context", "top context source")
     widths = [max(len(str(r[i])) for r in [header, *rows]) for i in range(len(header))]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
-    lines = [f"== Summary (gate threshold {threshold}) ==", fmt.format(*header), fmt.format(*("-" * w for w in widths))]
+    lines = ["== Summary ==", fmt.format(*header), fmt.format(*("-" * w for w in widths))]
     lines += [fmt.format(*r) for r in rows]
-    failed = sum(1 for r in rows if r[5] != "PASS")
-    lines.append(f"\n{failed}/{len(rows)} queries would be refused by the confidence gate (or errored).")
+    failed = sum(1 for r in rows if r[5] != "YES")
+    lines.append(f"\n{failed}/{len(rows)} queries got no textbook context (or errored).")
     return "\n".join(lines)
 
 

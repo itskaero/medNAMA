@@ -103,6 +103,11 @@ class MCQ(Base):
     status: Mapped[str] = mapped_column(Text, server_default="pending")
     difficulty: Mapped[int | None] = mapped_column(default=None)  # 1 (easiest) - 5 (hardest), None = unspecified
     error_message: Mapped[str | None] = mapped_column(Text, default=None)
+    # Database-aware generation (migration b7d2e4f6a8c1)
+    stem_embedding: Mapped[list[float] | None] = mapped_column(Vector(1024), default=None, deferred=True)
+    source_chunk_ids: Mapped[list | None] = mapped_column(JSONB, default=None)
+    tested_concept: Mapped[str | None] = mapped_column(Text, default=None)
+    grounding: Mapped[str | None] = mapped_column(Text, default=None)  # 'book' | 'ai'
 
     book: Mapped["Book | None"] = relationship()
 
@@ -229,3 +234,27 @@ class Flashcard(Base):
     user: Mapped["User"] = relationship()
 
 
+
+
+class AnswerReport(Base):
+    """A user's flag on a chat answer or MCQ, reviewed by admins (migration c9e3a5b7d2f4)."""
+
+    __tablename__ = "answer_reports"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    kind: Mapped[str] = mapped_column(Text)  # 'chat' | 'mcq'
+    mcq_id: Mapped[int | None] = mapped_column(ForeignKey("mcqs.id", ondelete="CASCADE"), default=None)
+    question: Mapped[str | None] = mapped_column(Text, default=None)
+    answer_excerpt: Mapped[str | None] = mapped_column(Text, default=None)
+    reason: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, server_default="open")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    resolved_at: Mapped[datetime | None] = mapped_column(default=None)
+
+    user: Mapped["User"] = relationship()
+
+    __table_args__ = (
+        CheckConstraint("kind IN ('chat', 'mcq')"),
+        CheckConstraint("status IN ('open', 'resolved', 'dismissed')"),
+    )

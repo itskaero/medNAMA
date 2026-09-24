@@ -69,6 +69,9 @@ interface ChatViewProps {
   setScope?: (s: ChatScope) => void;
   chapters?: string[];
   fetchChapters?: (bookId: number) => void;
+  // Study level for answer depth
+  level?: string | null;
+  setLevel?: (level: string | null) => void;
 }
 
 export default function ChatView({
@@ -103,6 +106,8 @@ export default function ChatView({
   setScope,
   chapters = [],
   fetchChapters,
+  level = null,
+  setLevel,
 }: ChatViewProps) {
   // Scroll to bottom whenever messages change
   useEffect(() => {
@@ -412,6 +417,22 @@ export default function ChatView({
                     ariaLabel="Scope retrieval to a textbook"
                   />
                 </div>
+
+                {setLevel ? (
+                  <div style={{ width: "170px" }} title="Sets the depth and focus of answers">
+                    <BasicDropdown
+                      items={[
+                        { value: "any", label: "Level: General" },
+                        { value: "undergraduate", label: "Level: MBBS" },
+                        { value: "fcps1", label: "Level: FCPS-I" },
+                        { value: "fcps2", label: "Level: FCPS-II" },
+                      ]}
+                      value={level ?? "any"}
+                      onChange={(val) => setLevel(val === "any" ? null : val)}
+                      ariaLabel="Study level for answers"
+                    />
+                  </div>
+                ) : null}
 
                 {scope?.book_id ? (
                   <div style={{ width: "220px", maxWidth: "40vw" }}>

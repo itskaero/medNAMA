@@ -1,10 +1,54 @@
 import React, { useState, useEffect } from "react";
 import { Stethoscope, AlertCircle, Check, Copy, Bookmark } from "lucide-react";
-import { Message, Figure } from "../types";
+import { Message, Figure, Grounding } from "../types";
 import { CitationsDrawer } from "./CitationsDrawer";
 import { FiguresDrawer } from "./FiguresDrawer";
 import { SourcesPanel } from "./SourcesPanel";
+import { ReportButton } from "./ReportButton";
 import { parseMarkdown } from "../utils/markdown";
+import { CHAT_STAGE_TEXT } from "../hooks/useChat";
+
+const GROUNDING_LABELS: Record<Exclude<Grounding, "none">, { text: string; title: string; color: string }> = {
+  textbook: {
+    text: "Textbook-backed",
+    title: "Every fact in this answer is cited from your ingested textbooks.",
+    color: "var(--sea-green)",
+  },
+  partial: {
+    text: "Partly textbook-backed",
+    title: "Cited textbook facts, plus a labelled section of AI clinical knowledge the books don't state.",
+    color: "var(--sky)",
+  },
+  ai_only: {
+    text: "AI knowledge only",
+    title: "The textbooks didn't cover this; the answer is from AI clinical knowledge and has no citations. Verify before relying on it.",
+    color: "var(--warning, #d9a441)",
+  },
+};
+
+/** Small label showing how much of the answer comes from the textbooks. */
+function GroundingBadge({ grounding }: { grounding?: Grounding }) {
+  if (!grounding || grounding === "none") return null;
+  const g = GROUNDING_LABELS[grounding];
+  return (
+    <span
+      title={g.title}
+      style={{
+        display: "inline-block",
+        marginBottom: "var(--sp-2)",
+        padding: "2px 8px",
+        borderRadius: "999px",
+        border: `1px solid ${g.color}`,
+        color: g.color,
+        fontSize: "0.68rem",
+        fontFamily: "var(--font-mono)",
+        letterSpacing: "0.02em",
+      }}
+    >
+      {g.text}
+    </span>
+  );
+}
 
 export function AIMessage({
   msg,
@@ -59,7 +103,7 @@ export function AIMessage({
               <span className="thinking-dot" />
             </div>
             <span style={{ fontSize: "0.82rem", color: "var(--text-secondary)" }}>
-              {stagesText[thinkingStage]}
+              {(msg.stage && CHAT_STAGE_TEXT[msg.stage]) || stagesText[thinkingStage]}
             </span>
           </div>
         ) : null}
@@ -71,6 +115,7 @@ export function AIMessage({
         ) : null}
         {msg.type === "ai" && msg.answer ? (
           <>
+            <GroundingBadge grounding={msg.answer.grounding} />
             <div
               className="prose"
               dangerouslySetInnerHTML={{ __html: parseMarkdown(msg.answer.answer_markdown) }}
@@ -116,6 +161,7 @@ export function AIMessage({
                     <span>Save</span>
                   </button>
                 ) : null}
+                <ReportButton kind="chat" token={token} question={msg.query} answerExcerpt={msg.answer.answer_markdown} />
               </div>
             </div>
           </>

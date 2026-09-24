@@ -5,6 +5,7 @@ import { GraduationCap, X, Loader2 } from "lucide-react";
 import { AnswerResponse, Figure } from "@/types";
 import { parseMarkdown } from "@/utils/markdown";
 import { CitationsDrawer, FiguresDrawer } from "@/components";
+import { ReportButton } from "@/components/ReportButton";
 
 interface ExplanationPanelProps {
   explanationMCQId: number | null;
@@ -34,13 +35,21 @@ export default function ExplanationPanel({
           <GraduationCap size={16} style={{ color: "var(--teal)" }} />
           RAG Explanation
         </h3>
-        <button
-          className="close-btn"
-          onClick={() => setExplanationMCQId(null)}
-          aria-label="Close explanation panel"
-        >
-          <X size={16} />
-        </button>
+        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+          <ReportButton
+            kind="mcq"
+            token={token}
+            mcqId={explanationMCQId}
+            answerExcerpt={explanationData?.answer_markdown}
+          />
+          <button
+            className="close-btn"
+            onClick={() => setExplanationMCQId(null)}
+            aria-label="Close explanation panel"
+          >
+            <X size={16} />
+          </button>
+        </div>
       </div>
       <div className="explanation-inline-body">
         {explanationLoading ? (

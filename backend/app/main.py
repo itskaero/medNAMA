@@ -4,6 +4,7 @@ Defines HTTP API endpoints for authentication (login, registration, profiles),
 book management, PDF ingestion, hybrid RAG query answering, and figure rendering.
 """
 
+import logging
 import os
 import shutil
 import tempfile
@@ -14,11 +15,11 @@ from typing import Any
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile, status, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
 from app.database import SessionLocal, engine
@@ -26,7 +27,7 @@ from app.generation import generate_answer, generate_mcq_explanation
 from app.ingestion import ingest_book
 from app.models import (
     Base, Book, Chunk, Figure, User, MCQ, QuizAttempt, AttemptAnswer,
-    ChatConversation, ChatMessage, MCQBookmark, ConceptBookmark, Note, Flashcard
+    ChatConversation, ChatMessage, MCQBookmark, ConceptBookmark, Note, Flashcard, AnswerReport
 )
 from app.auth import (
     hash_password,
@@ -37,6 +38,16 @@ from app.auth import (
     require_student_or_admin,
     rate_limiter,
 )
+
+# App loggers (app.retrieval, app.generation, ...) had no handler, so their INFO
+# lines never reached `docker logs`. uvicorn's own loggers are unaffected.
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+for _noisy in ("httpx", "httpcore", "openai", "sentence_transformers", "huggingface_hub"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(title="medNAMA Core API", version="1.0.0")
@@ -105,6 +116,9 @@ def warmup_models():
     _ = get_embedding_model()
     print("WARMING UP QUANTIZED CROSS-ENCODER RERANKER MODEL...")
     _ = get_reranker_model()
+    from app.retrieval import get_second_stage_reranker
+    print("WARMING UP SECOND-STAGE (BIOMEDICAL) RERANKER...")
+    _ = get_second_stage_reranker()
     print("Warmup complete. All models preloaded and INT8 quantized in RAM.")
     print("="*60 + "\n")
 
@@ -124,42 +138,13 @@ class QueryRequest(BaseModel):
     confidence_threshold: float = 0.55
 
 
-def _is_near_duplicate(stem_key: str, existing_stems: list[str]) -> bool:
-    """True if the given MCQ stem is effectively a duplicate of an existing stem.
-
-    Because only 30 recent same-book stems are in context, similarity to a
-    larger historical bank is checked post-hoc with subsequence + fuzzy ratio:
-      - if one stem contains the other (normalized) → duplicate
-      - difflib ratio > 0.8 → near-duplicate
-    """
-    import difflib
-
-    normalized = " ".join(stem_key.split())
-    if not normalized:
-        return True
-    for existing in existing_stems:
-        existing_norm = " ".join(existing.split())
-        if not existing_norm:
-            continue
-        if normalized == existing_norm:
-            return True
-        # Substring containment on >= 60-char stems is a strong dup signal
-        if len(normalized) >= 60 and (
-            normalized in existing_norm or existing_norm in normalized
-        ):
-            return True
-        ratio = difflib.SequenceMatcher(None, normalized, existing_norm).ratio()
-        if ratio > 0.8:
-            return True
-    return False
-
-
 class ChatQueryRequest(BaseModel):
     query: str
     conversation_id: int | None = None
     confidence_threshold: float = 0.55
     book_id: int | None = None
     chapter: str | None = None
+    level: str | None = None  # 'undergraduate' | 'fcps1' | 'fcps2'
 
 
 class ConceptBookmarkCreate(BaseModel):
@@ -567,47 +552,37 @@ class GenerateAiQuizRequest(BaseModel):
     page_number: int | None = None
     count: int | None = None
     difficulty: int | None = None  # 1 (easy) - 5 (hard); falls back to AI_MCQ_DIFFICULTY env
+    exam_profile: str | None = None  # 'fcps' (A-E, default) | 'usmle' (A-D)
+    request_id: str | None = None  # client idempotency key; a retry returns the same set
 
 
-@app.post("/api/chat/generate-ai-quiz")
-def generate_ai_quiz(
-    req: GenerateAiQuizRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_student_or_admin),
-):
-    """Generates custom board-style MCQs from textbook RAG context or page filters."""
+def _resolve_quiz_params(req: GenerateAiQuizRequest) -> dict:
+    """Validate a quiz request and resolve page / count / difficulty from the prompt and env."""
     import re
-    import uuid
-    from app.retrieval import RetrievalService
-    from openai import OpenAI
 
     prompt_text = req.prompt.strip()
     if not prompt_text:
         raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
 
-    # 1. Parse prompt for page number and count if not provided
     page_num = req.page_number
     if page_num is None:
         page_match = re.search(r"page\s*#?\s*(\d+)", prompt_text, re.IGNORECASE)
         if page_match:
             page_num = int(page_match.group(1))
 
-    # 1. Resolve requested count: multiples of 5 only, max 20
+    # Multiples of 5 only, max 20
     ALLOWED_COUNTS = (5, 10, 15, 20)
     mcq_count = req.count or 5
     count_match = re.search(r"(\d+)\s*(?:questions?|mcqs?|items?)", prompt_text, re.IGNORECASE)
     if count_match:
-        try:
-            mcq_count = int(count_match.group(1))
-        except ValueError:
-            pass
+        mcq_count = int(count_match.group(1))
     if mcq_count not in ALLOWED_COUNTS:
         raise HTTPException(
             status_code=400,
             detail="count must be a multiple of 5 between 5 and 20 (5, 10, 15, or 20).",
         )
 
-    # 1b. Resolve difficulty: explicit request > AI_MCQ_DIFFICULTY env override > unspecified
+    # Difficulty: explicit request > AI_MCQ_DIFFICULTY env override > unspecified
     difficulty = req.difficulty
     if difficulty is None:
         env_diff = os.environ.get("AI_MCQ_DIFFICULTY", "").strip()
@@ -616,198 +591,82 @@ def generate_ai_quiz(
     if difficulty is not None and not (1 <= difficulty <= 5):
         raise HTTPException(status_code=400, detail="difficulty must be an integer between 1 and 5.")
 
-    # 2. Retrieve textbook context
-    retrieved_chunks = []
-    if page_num is not None:
-        query = db.query(Chunk)
-        if req.book_id:
-            query = query.filter(Chunk.book_id == req.book_id)
-        retrieved_chunks = query.filter(Chunk.page_number == page_num).all()
+    from app.llm import llm_configured
 
-    if not retrieved_chunks:
-        # Fallback to RAG vector search
-        retrieval_srv = RetrievalService()
-        retrieved_chunks = retrieval_srv.hybrid_search(db, query=prompt_text, limit=6, book_id=req.book_id)
-
-    context_str = "\n\n".join(
-        [
-            f"[Book: {c.book.title if hasattr(c, 'book') and c.book else 'Textbook'} | Page: {c.page_number or 'N/A'}]\n{c.content}"
-            for c in retrieved_chunks
-        ]
-    )
-
-    if not context_str.strip():
-        context_str = f"Topic: {prompt_text}"
-
-    # 3. Prompt DeepSeek LLM with strict JSON schema
-    difficulty_line = ""
-    if difficulty is not None:
-        difficulty_line = (
-            f"TARGET DIFFICULTY LEVEL: {difficulty}/5.\n"
-            "Scale guide: 1 = simple recall of well-known facts; 2 = straightforward application; "
-            "3 = standard board-style with moderately challenging distractors; "
-            "4 = complex multi-step clinical reasoning; "
-            "5 = very high-yield questions with subtle, ambiguous distractors requiring deep integration.\n"
-            "Write EVERY question in this set at the target difficulty level, and vary the vignette style accordingly.\n\n"
-        )
-    system_prompt = (
-        "You are an expert medical educator and board exam question writer. "
-        "Generate high-yield, USMLE/board-style Multiple Choice Questions based strictly on the provided medical textbook context.\n"
-        f"{difficulty_line}"
-        "Return ONLY valid JSON matching this exact structure:\n"
-        "{\n"
-        '  "quiz_title": "Short descriptive topic title",\n'
-        '  "questions": [\n'
-        "    {\n"
-        '      "question_text": "Clinical vignette question stem...",\n'
-        '      "options": {"A": "Choice A", "B": "Choice B", "C": "Choice C", "D": "Choice D"},\n'
-        '      "correct_option": "A",\n'
-        '      "explanation": "Detailed clinical reasoning explaining why the correct choice is right and others are incorrect.",\n'
-        '      "source_book": "Book Title",\n'
-        '      "source_page": 120\n'
-        "    }\n"
-        "  ]\n"
-        "}"
-    )
-
-    if not settings.deepseek_api_key or settings.deepseek_api_key == "sk-dummy":
-        raise HTTPException(
-            status_code=400,
-            detail="DEEPSEEK_API_KEY environment variable is not configured on the server. Please set DEEPSEEK_API_KEY in Railway project settings."
-        )
-
-    client = OpenAI(
-        api_key=settings.deepseek_api_key,
-        base_url=settings.deepseek_base_url
-    )
-
-    # 3b. Anti-repeat generation (F3.5): feed recent same-book MCQs into the prompt
-    # and drop near-duplicates after generation.
-    recent_existing = []
-    existing_query = db.query(MCQ)
-    if req.book_id:
-        existing_query = existing_query.filter(MCQ.book_id == req.book_id)
-    # no_autoflush: the chat pipeline may leave transient Chunk objects pending on
-    # the session; autoflushing them here is wasteful and noisy (SAWarning).
-    with db.no_autoflush:
-        recent_existing = existing_query.order_by(MCQ.id.desc()).limit(30).all()
-    existing_stems = [
-        (m.question_text or "").strip().lower()
-        for m in recent_existing
-        if m.question_text and (m.question_text or "").strip()
-    ]
-    dedup_context_lines = "\n".join(
-        f"- {(m.question_text or '')[:200]}" for m in recent_existing
-    ) or "None"
-    duplicates_skipped = 0
-    all_questions: list[dict] = []
-    all_new_stems: list[str] = []
-
-    # 3c. Generate in batches of 5 so the LLM stays reliable and focused.
-    BATCH_SIZE = 5
-    quiz_title = prompt_text[:40].title()
-    for batch_start in range(0, mcq_count, BATCH_SIZE):
-        batch_target = min(BATCH_SIZE, mcq_count - batch_start)
-        user_prompt = (
-            f"USER PROMPT: {prompt_text}\n\n"
-            f"Generate exactly {batch_target} high-yield MCQs from this prompt, grounded in the textbook context.\n\n"
-            f"TEXTBOOK CONTEXT:\n{context_str[:6000]}\n\n"
-            "RECENTLY GENERATED QUESTIONS FROM THIS BOOK (do NOT repeat these stems, clinical scenarios, "
-            "answer options, or correct-answer patterns — write fresh vignettes):\n"
-            f"{dedup_context_lines}"
-        )
-
-        try:
-            completion = client.chat.completions.create(
-                model=settings.deepseek_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.3,
-            )
-            raw_res = completion.choices[0].message.content or "{}"
-            quiz_data = json.loads(raw_res)
-        except Exception as e:
-            logger.error(f"AI Quiz Generation error (batch {batch_start // BATCH_SIZE + 1}): {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to generate quiz: {e}")
-
-        batch_questions = quiz_data.get("questions", [])
-        if not batch_questions:
-            raise HTTPException(status_code=500, detail="LLM did not return valid question sets.")
-
-        for item in batch_questions:
-            stem = (item.get("question_text") or "").strip()
-            stem_key = stem.lower()
-            if not stem_key or _is_near_duplicate(stem_key, existing_stems + all_new_stems):
-                duplicates_skipped += 1
-                continue
-            all_questions.append(item)
-            all_new_stems.append(stem_key)
-
-    if not all_questions:
-        raise HTTPException(
-            status_code=500,
-            detail="All generated questions were duplicates of existing MCQs. Try a different prompt or topic.",
-        )
-
-    quiz_set_id = f"quiz_set_{uuid.uuid4().hex[:8]}"
-    created_mcqs = []
-
-    for item in all_questions:
-        book_id = req.book_id
-        page_ref = item.get("source_page") or page_num
-        source_book_name = item.get("source_book") or "Medical Textbook"
-
-        explanation_txt = item.get("explanation") or "No detailed explanation provided."
-        if page_ref or source_book_name:
-            explanation_txt += f"\n\n**Source**: {source_book_name}, Page {page_ref or 'N/A'}"
-
-        mcq = MCQ(
-            book_id=book_id,
-            quiz_set_id=quiz_set_id,
-            quiz_set_title=quiz_title,
-            question_text=item.get("question_text", "Untitled Question"),
-            options=item.get("options", {"A": "Option A", "B": "Option B", "C": "Option C", "D": "Option D"}),
-            correct_option=item.get("correct_option", "A").upper(),
-            topic=quiz_title,
-            main_category="AI MCQs",
-            sub_category=source_book_name,
-            difficulty=difficulty,
-            explanation_markdown=explanation_txt,
-            status="ready",
-        )
-        db.add(mcq)
-        created_mcqs.append(mcq)
-
-    try:
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        import logging
-        logging.getLogger("uvicorn.error").error(f"Database error committing generated quiz: {e}")
-        raise HTTPException(status_code=500, detail=f"Database commit error: {e}")
+    if not llm_configured():
+        raise HTTPException(status_code=400, detail="DEEPSEEK_API_KEY is not configured on the server.")
 
     return {
-        "quiz_set_id": quiz_set_id,
-        "quiz_set_title": quiz_title,
-        "total_questions": len(created_mcqs),
-        "duplicates_skipped": duplicates_skipped,
+        "prompt_text": prompt_text,
+        "book_id": req.book_id,
+        "page_num": page_num,
+        "mcq_count": mcq_count,
         "difficulty": difficulty,
-        "mcqs": [
-            {
-                "id": m.id,
-                "question_text": m.question_text,
-                "options": m.options,
-                "correct_option": m.correct_option,
-                "topic": m.topic,
-                "difficulty": m.difficulty,
-                "explanation_markdown": m.explanation_markdown,
-            }
-            for m in created_mcqs
-        ],
+        "exam_profile": req.exam_profile,
+        "request_id": req.request_id,
     }
+
+
+@app.post("/api/chat/generate-ai-quiz")
+def generate_ai_quiz(
+    req: GenerateAiQuizRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Generates MCQs synchronously (kept for API clients; the UI uses the job endpoints)."""
+    from app.quiz_generation import QuizGenerationError, generate_quiz_set
+
+    params = _resolve_quiz_params(req)
+    try:
+        return generate_quiz_set(db, **params)
+    except QuizGenerationError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+
+
+@app.post("/api/chat/generate-ai-quiz/jobs", status_code=status.HTTP_202_ACCEPTED)
+def start_ai_quiz_job(
+    req: GenerateAiQuizRequest,
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Start MCQ generation in the background and return a job id to poll.
+
+    The request returns immediately, so no proxy or browser timeout can cut it
+    off however long generation takes. Idempotent on request_id.
+    """
+    from app.quiz_generation import start_quiz_job
+
+    params = _resolve_quiz_params(req)
+    return start_quiz_job(params)
+
+
+@app.get("/api/chat/generate-ai-quiz/jobs/{job_id}")
+def get_ai_quiz_job(
+    job_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Poll a background MCQ job: {status: running|done|failed, stage?, result?, detail?}."""
+    from app.quiz_generation import get_quiz_job
+
+    job = get_quiz_job(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Quiz job not found.")
+    return job
+
+
+@app.get("/api/chat/ai-quizzes/{quiz_set_id}")
+def get_ai_quiz_set(
+    quiz_set_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Return a saved AI quiz set (used to recover a set whose generate request timed out client-side)."""
+    from app.quiz_generation import load_quiz_set, serialize_quiz_set
+
+    mcqs = load_quiz_set(db, quiz_set_id)
+    if not mcqs:
+        raise HTTPException(status_code=404, detail="Quiz set not found.")
+    return serialize_quiz_set(mcqs, quiz_set_id)
 
 
 @app.get("/api/chat/ai-quizzes")
@@ -863,6 +722,7 @@ class StartQuizRequest(BaseModel):
     num_questions: int = 10
     exclude_mastered: bool = False
     drill_wrong: bool = False                 # answer-only the user's missed MCQs
+    prefer_unseen: bool = True                # questions the user has never attempted come first
     timer_mode: str = "none"                      # "none" | "session" | "per_question"
     timer_value: int | None = None                # minutes or seconds
     feedback_mode: str = "tutor"                  # "tutor" | "board"
@@ -921,7 +781,18 @@ def start_quiz_endpoint(
         ).subquery()
         query = query.filter(MCQ.id.notin_(mastered_subquery))
         
-    mcqs = query.order_by(func.random()).limit(req.num_questions).all()
+    # Unseen first: never-attempted questions before ones already answered, so a
+    # growing bank keeps producing fresh practice. Random within each group.
+    if req.prefer_unseen and not req.drill_wrong:
+        from sqlalchemy import case
+
+        seen_subquery = db.query(AttemptAnswer.mcq_id).join(
+            QuizAttempt, QuizAttempt.id == AttemptAnswer.quiz_attempt_id
+        ).filter(QuizAttempt.user_id == current_user.id).subquery()
+        seen_rank = case((MCQ.id.in_(db.query(seen_subquery.c.mcq_id)), 1), else_=0)
+        mcqs = query.order_by(seen_rank, func.random()).limit(req.num_questions).all()
+    else:
+        mcqs = query.order_by(func.random()).limit(req.num_questions).all()
     
     if not mcqs:
         raise HTTPException(
@@ -1130,22 +1001,14 @@ def get_wrong_questions(
 
 # ======================== CONVERSATIONAL CHAT HISTORY ========================
 
-@app.post("/api/chat/query")
-def chat_query_endpoint(
-    req: ChatQueryRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_student_or_admin)
-):
-    """Conversational RAG query answering endpoint that tracks message logs in DB and maintains LLM memory context."""
+def _run_chat_turn(db: Session, req: "ChatQueryRequest", user_id: int, on_stage=None) -> dict:
+    """One chat turn: resolve/create the conversation, answer with history, persist both messages."""
     conv_id = req.conversation_id
     if not conv_id:
         # Create a new conversation and auto-title based on the query prefix
         words = req.query.strip().split()
         title_text = " ".join(words[:6]) + ("..." if len(words) > 6 else "")
-        if not title_text:
-            title_text = "New Conversation"
-            
-        conv = ChatConversation(user_id=current_user.id, title=title_text)
+        conv = ChatConversation(user_id=user_id, title=title_text or "New Conversation")
         db.add(conv)
         db.commit()
         db.refresh(conv)
@@ -1153,7 +1016,7 @@ def chat_query_endpoint(
     else:
         conv = db.query(ChatConversation).filter(
             ChatConversation.id == conv_id,
-            ChatConversation.user_id == current_user.id
+            ChatConversation.user_id == user_id
         ).first()
         if not conv:
             raise HTTPException(status_code=404, detail="Conversation session not found.")
@@ -1163,52 +1026,37 @@ def chat_query_endpoint(
         ChatMessage.conversation_id == conv_id
     ).order_by(ChatMessage.created_at.asc()).all()
 
-    recent_db_messages = db_messages[-10:] if len(db_messages) > 10 else db_messages
-
     history = []
-    for msg in recent_db_messages:
+    for msg in db_messages[-10:]:
         if msg.role == "user":
             history.append({"role": "user", "content": msg.content or ""})
         elif msg.role == "ai":
             ans_text = ""
             if msg.answer_json:
                 try:
-                    ans_data = json.loads(msg.answer_json)
-                    ans_text = ans_data.get("answer_markdown", "")
-                except:
+                    ans_text = json.loads(msg.answer_json).get("answer_markdown", "")
+                except (ValueError, AttributeError):
                     pass
-            if not ans_text:
-                ans_text = msg.content or ""
-            history.append({"role": "assistant", "content": ans_text})
+            history.append({"role": "assistant", "content": ans_text or msg.content or ""})
 
-    # Call LLM generation pipeline
     answer_dict = generate_answer(
-        session=db, 
-        query=req.query, 
+        session=db,
+        query=req.query,
         confidence_threshold=req.confidence_threshold,
         history=history,
         book_id=req.book_id,
-        chapter=req.chapter
+        chapter=req.chapter,
+        level=req.level,
+        on_stage=on_stage,
     )
 
-    # Save messages to database
-    user_msg = ChatMessage(
-        conversation_id=conv_id,
-        role="user",
-        content=req.query
-    )
-    db.add(user_msg)
-
-    serialized_answer = json.dumps(answer_dict)
-    ai_msg = ChatMessage(
+    db.add(ChatMessage(conversation_id=conv_id, role="user", content=req.query))
+    db.add(ChatMessage(
         conversation_id=conv_id,
         role="ai",
         content=answer_dict.get("answer_markdown", ""),
-        answer_json=serialized_answer
-    )
-    db.add(ai_msg)
-
-    from datetime import datetime
+        answer_json=json.dumps(answer_dict),
+    ))
     conv.updated_at = datetime.utcnow()
     db.commit()
 
@@ -1217,6 +1065,77 @@ def chat_query_endpoint(
         "conversation_title": conv.title,
         "answer": answer_dict
     }
+
+
+@app.post("/api/chat/query")
+def chat_query_endpoint(
+    req: ChatQueryRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Conversational RAG query answering endpoint that tracks message logs in DB and maintains LLM memory context."""
+    return _run_chat_turn(db, req, current_user.id)
+
+
+SSE_HEARTBEAT_S = 3.0
+
+
+def _sse(event: str, data: Any) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.post("/api/chat/query/stream")
+def chat_query_stream_endpoint(
+    req: ChatQueryRequest,
+    current_user: User = Depends(require_student_or_admin)
+):
+    """Same as /api/chat/query, streamed as Server-Sent Events.
+
+    Progress events ("stage") arrive as the pipeline advances and a comment
+    heartbeat is sent every few seconds, so no proxy or browser ever sees an
+    idle connection while retrieval and the AI call run. The final event is
+    "answer" (the /api/chat/query payload) or "error" ({"detail", "status"}).
+    """
+    import queue
+    import threading
+
+    user_id = current_user.id
+    events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
+
+    def work() -> None:
+        # Own session: request-scoped dependencies are closed before a
+        # streaming body runs.
+        db = SessionLocal()
+        try:
+            result = _run_chat_turn(db, req, user_id, on_stage=lambda stage: events.put(("stage", {"stage": stage})))
+            events.put(("answer", result))
+        except HTTPException as e:
+            events.put(("error", {"detail": e.detail, "status": e.status_code}))
+        except Exception as e:
+            logger.exception("Streaming chat turn failed")
+            events.put(("error", {"detail": f"Internal error: {e}", "status": 500}))
+        finally:
+            db.close()
+
+    def stream():
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        yield _sse("stage", {"stage": "received"})
+        while True:
+            try:
+                event, data = events.get(timeout=SSE_HEARTBEAT_S)
+            except queue.Empty:
+                yield ": keep-alive\n\n"
+                continue
+            yield _sse(event, data)
+            if event in ("answer", "error"):
+                break
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/chat/source/{chunk_id}")
@@ -1961,3 +1880,97 @@ def export_bookmarks_csv(
 
 
 
+# ─── Answer reports ("Report wrong answer") ────────────────────────────────
+
+class AnswerReportCreate(BaseModel):
+    kind: str  # 'chat' | 'mcq'
+    reason: str
+    mcq_id: int | None = None
+    question: str | None = None
+    answer_excerpt: str | None = None
+
+
+class AnswerReportUpdate(BaseModel):
+    status: str  # 'open' | 'resolved' | 'dismissed'
+
+
+def _serialize_report(r: AnswerReport) -> dict:
+    return {
+        "id": r.id,
+        "kind": r.kind,
+        "mcq_id": r.mcq_id,
+        "question": r.question,
+        "answer_excerpt": r.answer_excerpt,
+        "reason": r.reason,
+        "status": r.status,
+        "username": r.user.username if r.user else None,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "resolved_at": r.resolved_at.isoformat() if r.resolved_at else None,
+    }
+
+
+@app.post(
+    "/api/reports",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(rate_limiter(limit=20, window=60))],
+)
+def create_answer_report(
+    req: AnswerReportCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_student_or_admin),
+):
+    """Flag a chat answer or MCQ as wrong / badly cited / outdated for admin review."""
+    if req.kind not in ("chat", "mcq"):
+        raise HTTPException(status_code=400, detail="kind must be 'chat' or 'mcq'.")
+    reason = (req.reason or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="Please say what is wrong.")
+    if req.kind == "mcq":
+        if not req.mcq_id or not db.query(MCQ.id).filter(MCQ.id == req.mcq_id).first():
+            raise HTTPException(status_code=404, detail="MCQ not found.")
+    report = AnswerReport(
+        user_id=current_user.id,
+        kind=req.kind,
+        mcq_id=req.mcq_id if req.kind == "mcq" else None,
+        question=(req.question or "")[:2000] or None,
+        answer_excerpt=(req.answer_excerpt or "")[:4000] or None,
+        reason=reason[:2000],
+    )
+    db.add(report)
+    db.commit()
+    db.refresh(report)
+    logger.info("Answer report %d filed by %s (%s)", report.id, current_user.username, req.kind)
+    return _serialize_report(report)
+
+
+@app.get("/api/reports")
+def list_answer_reports(
+    status_filter: str = "open",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Admin review queue. status_filter: open | resolved | dismissed | all."""
+    q = db.query(AnswerReport).options(joinedload(AnswerReport.user))
+    if status_filter != "all":
+        q = q.filter(AnswerReport.status == status_filter)
+    return [_serialize_report(r) for r in q.order_by(AnswerReport.created_at.desc()).limit(200).all()]
+
+
+@app.patch("/api/reports/{report_id}")
+def update_answer_report(
+    report_id: int,
+    req: AnswerReportUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Mark a report resolved / dismissed (or reopen it)."""
+    if req.status not in ("open", "resolved", "dismissed"):
+        raise HTTPException(status_code=400, detail="status must be open, resolved or dismissed.")
+    report = db.query(AnswerReport).filter(AnswerReport.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found.")
+    report.status = req.status
+    report.resolved_at = None if req.status == "open" else datetime.utcnow()
+    db.commit()
+    db.refresh(report)
+    return _serialize_report(report)
